@@ -5,6 +5,7 @@ using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services;
 using UnityEditor;
+using UnityEditor.UIElements;
 using UnityEngine;
 using UnityEngine.UIElements;
 
@@ -24,7 +25,7 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
         private TextField gitUrlOverride;
         private Button browseGitUrlButton;
         private Button clearGitUrlButton;
-        private Toggle autoStartOnLoadToggle;
+        private EnumField autoStartPolicyField;
         private Toggle debugLogsToggle;
         private Toggle logRecordToggle;
         private Toggle devModeForceRefreshToggle;
@@ -67,7 +68,7 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             gitUrlOverride = Root.Q<TextField>("git-url-override");
             browseGitUrlButton = Root.Q<Button>("browse-git-url-button");
             clearGitUrlButton = Root.Q<Button>("clear-git-url-button");
-            autoStartOnLoadToggle = Root.Q<Toggle>("auto-start-on-load-toggle");
+            autoStartPolicyField = Root.Q<EnumField>("auto-start-policy-field");
             debugLogsToggle = Root.Q<Toggle>("debug-logs-toggle");
             logRecordToggle = Root.Q<Toggle>("log-record-toggle");
             devModeForceRefreshToggle = Root.Q<Toggle>("dev-mode-force-refresh-toggle");
@@ -151,13 +152,14 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             if (deployRestoreButton != null)
                 deployRestoreButton.tooltip = "Restore the last backup before deployment";
 
-            if (autoStartOnLoadToggle != null)
+            if (autoStartPolicyField != null)
             {
-                autoStartOnLoadToggle.tooltip = "Automatically start the local HTTP server and connect the MCP bridge when the Unity Editor opens. Only applies to HTTP transport (stdio always auto-starts).";
-                var autoStartLabel = autoStartOnLoadToggle.parent?.Q<Label>();
+                autoStartPolicyField.Init(AutoStartPolicy.Disabled);
+                autoStartPolicyField.tooltip = "Controls automatic startup of the local MCP HTTP server. Disabled: never auto-start. On Editor Load: start the server and connect the bridge once when the Editor opens. Keep Running: also try to revive the server after a domain reload if it has died. Only applies to HTTP transport (stdio always auto-starts).";
+                var autoStartLabel = autoStartPolicyField.parent?.Q<Label>();
                 if (autoStartLabel != null)
-                    autoStartLabel.tooltip = autoStartOnLoadToggle.tooltip;
-                autoStartOnLoadToggle.SetValueWithoutNotify(EditorPrefs.GetBool(EditorPrefKeys.AutoStartOnLoad, false));
+                    autoStartLabel.tooltip = autoStartPolicyField.tooltip;
+                autoStartPolicyField.SetValueWithoutNotify(AutoStartPolicySettings.Get());
             }
 
             gitUrlOverride.value = EditorPrefs.GetString(EditorPrefKeys.GitUrlOverride, "");
@@ -230,11 +232,13 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                 });
             }
 
-            if (autoStartOnLoadToggle != null)
+            if (autoStartPolicyField != null)
             {
-                autoStartOnLoadToggle.RegisterValueChangedCallback(evt =>
+                autoStartPolicyField.RegisterValueChangedCallback(evt =>
                 {
-                    EditorPrefs.SetBool(EditorPrefKeys.AutoStartOnLoad, evt.newValue);
+                    AutoStartPolicySettings.Set((AutoStartPolicy)evt.newValue);
+                    // Reconfiguring the policy clears any prior opt-out so the new policy applies immediately.
+                    AutoStartPolicySettings.SetSessionEndedByUser(false);
                 });
             }
 
@@ -362,8 +366,8 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             }
 
             gitUrlOverride.value = EditorPrefs.GetString(EditorPrefKeys.GitUrlOverride, "");
-            if (autoStartOnLoadToggle != null)
-                autoStartOnLoadToggle.value = EditorPrefs.GetBool(EditorPrefKeys.AutoStartOnLoad, false);
+            if (autoStartPolicyField != null)
+                autoStartPolicyField.SetValueWithoutNotify(AutoStartPolicySettings.Get());
             debugLogsToggle.value = EditorPrefs.GetBool(EditorPrefKeys.DebugLogs, false);
             if (logRecordToggle != null)
                 logRecordToggle.value = McpLogRecord.IsEnabled;

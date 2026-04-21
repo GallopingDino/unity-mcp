@@ -24,6 +24,14 @@ namespace MCPForUnity.Editor.Services
             TimeSpan.FromSeconds(30)
         };
 
+        // Used after a successful server revive in KeepRunning mode — short reconnect-only schedule.
+        private static readonly TimeSpan[] ReviveReconnectSchedule =
+        {
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(3),
+            TimeSpan.FromSeconds(5)
+        };
+
         static HttpBridgeReloadHandler()
         {
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
@@ -35,7 +43,12 @@ namespace MCPForUnity.Editor.Services
             try
             {
                 var transport = MCPServiceLocator.TransportManager;
-                bool shouldResume = transport.IsRunning(TransportMode.Http);
+                bool isRunning = transport.IsRunning(TransportMode.Http);
+                bool keepRunning = AutoStartPolicySettings.Get() == AutoStartPolicy.KeepRunning;
+
+                // In KeepRunning the post-reload handler must fire even when the bridge was idle
+                // before the reload, so revive can bring the server back.
+                bool shouldResume = isRunning || keepRunning;
 
                 if (shouldResume)
                 {
@@ -46,7 +59,7 @@ namespace MCPForUnity.Editor.Services
                     EditorPrefs.DeleteKey(EditorPrefKeys.ResumeHttpAfterReload);
                 }
 
-                if (shouldResume)
+                if (isRunning)
                 {
                     // beforeAssemblyReload is synchronous; force a synchronous teardown so we do not
                     // leave an orphaned socket due to an unfinished async close handshake.
@@ -108,6 +121,25 @@ namespace MCPForUnity.Editor.Services
 
         private static async Task ResumeHttpWithRetriesAsync()
         {
+            // KeepRunning fast path: server already known dead — skip the ~49s retry loop and revive directly.
+            if (AutoStartPolicySettings.Get() == AutoStartPolicy.KeepRunning && !MCPServiceLocator.Server.IsLocalHttpServerReachable())
+            {
+                // Suppress both revive and the "Failed to resume" warning if the user opted out —
+                // the warning would be misleading when nothing is actually failing.
+                if (AutoStartPolicySettings.IsSessionEndedByUser())
+                {
+                    return;
+                }
+
+                if (await TryReviveServerAsync())
+                {
+                    return;
+                }
+
+                McpLog.Warn("Failed to resume HTTP MCP bridge after domain reload");
+                return;
+            }
+
             Exception lastException = null;
 
             for (int i = 0; i < ResumeRetrySchedule.Length; i++)
@@ -150,6 +182,11 @@ namespace MCPForUnity.Editor.Services
                 }
             }
 
+            if (AutoStartPolicySettings.Get() == AutoStartPolicy.KeepRunning && await TryReviveServerAsync())
+            {
+                return;
+            }
+
             if (lastException != null)
             {
                 McpLog.Warn($"Failed to resume HTTP MCP bridge after domain reload: {lastException.Message}");
@@ -158,6 +195,67 @@ namespace MCPForUnity.Editor.Services
             {
                 McpLog.Warn("Failed to resume HTTP MCP bridge after domain reload");
             }
+        }
+
+        /// <summary>
+        /// KeepRunning fallback: launch the local HTTP server (if not already up) and try a short
+        /// reconnect schedule. Returns true if the bridge becomes connected.
+        /// </summary>
+        private static async Task<bool> TryReviveServerAsync()
+        {
+            if (AutoStartPolicySettings.IsSessionEndedByUser())
+            {
+                return false;
+            }
+
+            // Abort if the user switched transports while we were running the original retry loop.
+            if (!EditorConfigurationCache.Instance.UseHttpTransport)
+            {
+                return false;
+            }
+
+            // Server may have come up via another path (e.g. user clicked Start Server) — don't double-launch.
+            if (!MCPServiceLocator.Server.IsLocalHttpServerReachable())
+            {
+                McpLog.Info("[HTTP KeepRunning] Reviving local HTTP server after failed reconnect cycle");
+                bool started = MCPServiceLocator.Server.StartLocalHttpServer(quiet: true);
+                if (!started)
+                {
+                    McpLog.Warn("[HTTP KeepRunning] Failed to launch local HTTP server");
+                    return false;
+                }
+            }
+
+            for (int i = 0; i < ReviveReconnectSchedule.Length; i++)
+            {
+                int attempt = i + 1;
+                TimeSpan delay = ReviveReconnectSchedule[i];
+                McpLog.Debug($"[HTTP KeepRunning] Waiting {delay.TotalSeconds:0.#}s before revive-reconnect attempt {attempt}");
+                try { await Task.Delay(delay); }
+                catch { return false; }
+
+                if (!EditorConfigurationCache.Instance.UseHttpTransport)
+                {
+                    return false;
+                }
+
+                try
+                {
+                    bool connected = await MCPServiceLocator.TransportManager.StartAsync(TransportMode.Http);
+                    if (connected)
+                    {
+                        McpLog.Info("[HTTP KeepRunning] Bridge restored after server revive");
+                        MCPForUnityEditorWindow.RequestHealthVerification();
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    McpLog.Debug($"[HTTP KeepRunning] Revive-reconnect attempt {attempt} threw: {ex.Message}");
+                }
+            }
+
+            return false;
         }
     }
 }

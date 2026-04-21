@@ -66,6 +66,9 @@ namespace MCPForUnity.Editor.Constants
 
         internal const string ApiKey = "MCPForUnity.ApiKey";
 
+        internal const string AutoStartPolicy = "MCPForUnity.AutoStartPolicy";
+
+        [System.Obsolete("Superseded by AutoStartPolicy. Kept only for one-shot migration of existing user prefs.")]
         internal const string AutoStartOnLoad = "MCPForUnity.AutoStartOnLoad";
         internal const string BatchExecuteMaxCommands = "MCPForUnity.BatchExecute.MaxCommands";
         internal const string LogRecordEnabled = "MCPForUnity.LogRecordEnabled";

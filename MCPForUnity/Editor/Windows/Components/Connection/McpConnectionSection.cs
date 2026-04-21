@@ -633,6 +633,8 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                 if (serverRunning)
                 {
                     // Stop Server: end session first (if active), then stop the server.
+                    // Remember the opt-out so KeepRunning will not override it.
+                    AutoStartPolicySettings.SetSessionEndedByUser(true);
                     if (bridgeService.IsRunning)
                     {
                         await bridgeService.StopAsync();
@@ -659,6 +661,8 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                     bool serverStarted = MCPServiceLocator.Server.StartLocalHttpServer();
                     if (serverStarted)
                     {
+                        // Opted back in — clear the opt-out flag.
+                        AutoStartPolicySettings.SetSessionEndedByUser(false);
                         await TryAutoStartSessionAsync();
                     }
                     else
@@ -780,6 +784,9 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
             {
                 if (bridgeService.IsRunning)
                 {
+                    // Remember the opt-out so KeepRunning will not override it.
+                    AutoStartPolicySettings.SetSessionEndedByUser(true);
+
                     // Clear any resume flags when user manually ends the session to prevent
                     // getting stuck in "Resuming..." state (the flag may have been set by a
                     // domain reload that started just before the user clicked End Session)
@@ -814,6 +821,8 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                     bool started = await bridgeService.StartAsync();
                     if (started)
                     {
+                        // Opted back in — clear the opt-out flag.
+                        AutoStartPolicySettings.SetSessionEndedByUser(false);
                         await VerifyBridgeConnectionAsync();
                     }
                     else
