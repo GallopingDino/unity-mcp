@@ -214,6 +214,11 @@ namespace MCPForUnity.Editor.Services
                 return false;
             }
 
+            if (HttpEndpointUtility.IsRemoteScope())
+            {
+                return false;
+            }
+
             // Server may have come up via another path (e.g. user clicked Start Server) — don't double-launch.
             if (!MCPServiceLocator.Server.IsLocalHttpServerReachable())
             {

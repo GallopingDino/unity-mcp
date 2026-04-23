@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services.Transport.Transports;
@@ -16,6 +17,7 @@ namespace MCPForUnity.Editor.Services.Transport
         private TransportState _stdioState = TransportState.Disconnected("stdio");
         private Func<IMcpTransportClient> _webSocketFactory;
         private Func<IMcpTransportClient> _stdioFactory;
+        private Func<CancellationToken, Task> _httpReconnectFallback;
 
         public TransportManager()
         {
@@ -32,14 +34,33 @@ namespace MCPForUnity.Editor.Services.Transport
             _stdioFactory = stdioFactory ?? throw new ArgumentNullException(nameof(stdioFactory));
         }
 
+        public void SetHttpReconnectFallback(Func<CancellationToken, Task> fallback)
+        {
+            _httpReconnectFallback = fallback;
+            if (_httpClient is WebSocketTransportClient wsClient)
+            {
+                wsClient.SetReconnectFallback(fallback);
+            }
+        }
+
         private IMcpTransportClient GetOrCreateClient(TransportMode mode)
         {
             return mode switch
             {
-                TransportMode.Http => _httpClient ??= _webSocketFactory(),
+                TransportMode.Http => _httpClient ??= CreateHttpClient(),
                 TransportMode.Stdio => _stdioClient ??= _stdioFactory(),
                 _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported transport mode"),
             };
+        }
+
+        private IMcpTransportClient CreateHttpClient()
+        {
+            var client = _webSocketFactory();
+            if (client is WebSocketTransportClient wsClient && _httpReconnectFallback != null)
+            {
+                wsClient.SetReconnectFallback(_httpReconnectFallback);
+            }
+            return client;
         }
 
         public async Task<bool> StartAsync(TransportMode mode)

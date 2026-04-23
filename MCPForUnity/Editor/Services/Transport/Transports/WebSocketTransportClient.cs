@@ -57,6 +57,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private TimeSpan _socketKeepAliveInterval = DefaultKeepAliveInterval;
         private volatile bool _isConnected;
         private int _isReconnectingFlag;
+        private Func<CancellationToken, Task> _onReconnectScheduleExhausted;
         private TransportState _state = TransportState.Disconnected(TransportDisplayName, "Transport not started");
         private string _apiKey;
         private bool _disposed;
@@ -195,6 +196,11 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             try { _lifecycleCts?.Dispose(); } catch { }
             _lifecycleCts = null;
+        }
+
+        public void SetReconnectFallback(Func<CancellationToken, Task> onScheduleExhausted)
+        {
+            _onReconnectScheduleExhausted = onScheduleExhausted;
         }
 
         public async Task<bool> VerifyAsync()
@@ -799,6 +805,14 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 // server outage longer than ~49 s doesn't leave the plugin permanently dead.
                 McpLog.Warn($"[WebSocket] Initial reconnect schedule exhausted. Retrying every {ReconnectTailInterval.TotalSeconds}s until cancelled.");
                 _state = _state.WithError($"Server unreachable – retrying every {ReconnectTailInterval.TotalSeconds} s");
+
+                var fallback = _onReconnectScheduleExhausted;
+                if (fallback != null)
+                {
+                    try { await fallback(token).ConfigureAwait(false); }
+                    catch (Exception ex) { McpLog.Warn($"[WebSocket] Reconnect fallback threw: {ex.Message}"); }
+                }
+
                 while (!token.IsCancellationRequested)
                 {
                     try { await Task.Delay(ReconnectTailInterval, token).ConfigureAwait(false); }

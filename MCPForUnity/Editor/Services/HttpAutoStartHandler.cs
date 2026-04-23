@@ -33,8 +33,7 @@ namespace MCPForUnity.Editor.Services
 
             // Only check lightweight EditorPrefs here — services like EditorConfigurationCache
             // and MCPServiceLocator may not be initialized yet on fresh editor launch.
-            bool autoStartEnabled = AutoStartPolicySettings.Get() != AutoStartPolicy.Disabled;
-            if (!autoStartEnabled) return;
+            if (AutoStartPolicySettings.Get() == AutoStartPolicy.Disabled) return;
 
             SessionState.SetBool(SessionInitKey, true);
 
@@ -46,8 +45,7 @@ namespace MCPForUnity.Editor.Services
         {
             try
             {
-                bool autoStartEnabled = AutoStartPolicySettings.Get() != AutoStartPolicy.Disabled;
-                if (!autoStartEnabled) return;
+                if (AutoStartPolicySettings.Get() == AutoStartPolicy.Disabled) return;
 
                 bool useHttp = EditorConfigurationCache.Instance.UseHttpTransport;
                 if (!useHttp) return;
