@@ -67,6 +67,7 @@ namespace MCPForUnity.Editor.Constants
         internal const string ApiKey = "MCPForUnity.ApiKey";
 
         internal const string AutoStartOnLoad = "MCPForUnity.AutoStartOnLoad";
+        internal const string HeadlessLocalHttpServer = "MCPForUnity.HeadlessLocalHttpServer";
         internal const string BatchExecuteMaxCommands = "MCPForUnity.BatchExecute.MaxCommands";
         internal const string LogRecordEnabled = "MCPForUnity.LogRecordEnabled";
 

@@ -138,5 +138,35 @@ namespace MCPForUnity.Editor.Services.Server
             };
 #endif
         }
+
+        /// <inheritdoc/>
+        public System.Diagnostics.ProcessStartInfo CreateHeadlessProcessStartInfo(string command)
+        {
+            if (string.IsNullOrWhiteSpace(command))
+                throw new ArgumentException("Command cannot be empty", nameof(command));
+
+            command = command.Replace("\r", "").Replace("\n", "");
+
+#if UNITY_EDITOR_WIN
+            return new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c {command}",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
+            };
+#else
+            string shell = System.IO.File.Exists("/bin/bash") ? "/bin/bash" : "/bin/sh";
+            string escapedCommand = command.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            return new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = shell,
+                Arguments = $"-c \"{escapedCommand}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+#endif
+        }
     }
 }

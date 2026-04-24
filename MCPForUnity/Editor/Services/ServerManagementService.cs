@@ -292,9 +292,14 @@ namespace MCPForUnity.Editor.Services
                 launchCommand = $"{displayCommand} --pidfile {QuoteIfNeeded(pidFilePath)} --unity-instance-token {instanceToken}";
             }
 
+            bool isHeadless = IsHeadlessModeEnabled();
+            string modeDescription = isHeadless
+                ? "in the background (headless mode)"
+                : "in a new terminal window";
+
             if (!quiet && !EditorUtility.DisplayDialog(
                 "Start Local HTTP Server",
-                $"This will start the MCP server in HTTP mode in a new terminal window:\n\n{launchCommand}\n\n" +
+                $"This will start the MCP server in HTTP mode {modeDescription}:\n\n{launchCommand}\n\n" +
                 "Continue?",
                 "Start Server",
                 "Cancel"))
@@ -317,14 +322,13 @@ namespace MCPForUnity.Editor.Services
                 }
                 catch { }
 
-                // Launch the server in a new terminal window (keeps user-visible logs).
-                var startInfo = CreateTerminalProcessStartInfo(launchCommand);
+                var startInfo = isHeadless ? CreateHeadlessProcessStartInfo(launchCommand) : CreateTerminalProcessStartInfo(launchCommand);
                 System.Diagnostics.Process.Start(startInfo);
                 if (!string.IsNullOrEmpty(pidFilePath))
                 {
                     StoreLocalHttpServerHandshake(pidFilePath, instanceToken);
                 }
-                McpLog.Info($"Started local HTTP server in terminal: {launchCommand}");
+                McpLog.Info($"Started local HTTP server{(isHeadless ? " (headless)" : "")}: {launchCommand}");
                 return true;
             }
             catch (Exception ex)
@@ -940,6 +944,16 @@ namespace MCPForUnity.Editor.Services
         private System.Diagnostics.ProcessStartInfo CreateTerminalProcessStartInfo(string command)
         {
             return _terminalLauncher.CreateTerminalProcessStartInfo(command);
+        }
+
+        private System.Diagnostics.ProcessStartInfo CreateHeadlessProcessStartInfo(string command)
+        {
+            return _terminalLauncher.CreateHeadlessProcessStartInfo(command);
+        }
+
+        private static bool IsHeadlessModeEnabled()
+        {
+            return EditorPrefs.GetBool(EditorPrefKeys.HeadlessLocalHttpServer, false);
         }
     }
 }

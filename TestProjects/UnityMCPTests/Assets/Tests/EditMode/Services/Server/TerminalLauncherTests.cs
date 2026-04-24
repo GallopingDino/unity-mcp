@@ -156,6 +156,39 @@ namespace MCPForUnityTests.Editor.Services.Server
 
         #endregion
 
+        #region CreateHeadlessProcessStartInfo Tests
+
+        [Test]
+        public void CreateHeadlessProcessStartInfo_ValidCommand_ReturnsStartInfo()
+        {
+            // Act
+            var startInfo = _launcher.CreateHeadlessProcessStartInfo("echo hello");
+
+            // Assert
+            Assert.IsNotNull(startInfo);
+            Assert.IsNotNull(startInfo.FileName);
+            Assert.IsNotEmpty(startInfo.FileName);
+            Assert.IsFalse(startInfo.UseShellExecute);
+            Assert.IsTrue(startInfo.CreateNoWindow);
+        }
+
+        [Test]
+        public void CreateHeadlessProcessStartInfo_ReturnsAppropriateShell()
+        {
+            // Act
+            var startInfo = _launcher.CreateHeadlessProcessStartInfo("echo test");
+
+            // Assert
+#if UNITY_EDITOR_WIN
+            Assert.AreEqual("cmd.exe", startInfo.FileName, "Windows should use 'cmd.exe'");
+#else
+            Assert.IsTrue(startInfo.FileName == "/bin/bash" || startInfo.FileName == "/bin/sh", 
+                $"Unix should use bash or sh, got: {startInfo.FileName}");
+#endif
+        }
+
+        #endregion
+
         #region Interface Implementation Tests
 
         [Test]
@@ -176,6 +209,7 @@ namespace MCPForUnityTests.Editor.Services.Server
             {
                 launcher.GetProjectRootPath();
                 launcher.CreateTerminalProcessStartInfo("test");
+                launcher.CreateHeadlessProcessStartInfo("test");
             });
         }
 

@@ -17,6 +17,14 @@ namespace MCPForUnity.Editor.Services.Server
         ProcessStartInfo CreateTerminalProcessStartInfo(string command);
 
         /// <summary>
+        /// Creates a ProcessStartInfo for running a command without a visible window.
+        /// Works cross-platform: macOS, Windows, and Linux.
+        /// </summary>
+        /// <param name="command">The command to execute</param>
+        /// <returns>A configured ProcessStartInfo for headless execution</returns>
+        ProcessStartInfo CreateHeadlessProcessStartInfo(string command);
+
+        /// <summary>
         /// Gets the project root path for storing terminal scripts.
         /// </summary>
         /// <returns>Path to the project root directory</returns>
