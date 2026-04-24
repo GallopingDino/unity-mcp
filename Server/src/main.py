@@ -779,6 +779,13 @@ Examples:
              "Used by Unity to stop the exact process it launched when running in a terminal."
     )
     parser.add_argument(
+        "--ephemeral",
+        action="store_true",
+        help="Self-terminate when no Unity instances remain connected (HTTP local mode only). "
+             "Unity sets this automatically for managed server launches. "
+             "Ignored when --http-remote-hosted is set."
+    )
+    parser.add_argument(
         "--project-scoped-tools",
         action="store_true",
         help="Keep custom tools scoped to the active Unity project and enable the custom tools resource. "
@@ -861,6 +868,15 @@ Examples:
 
     os.environ["UNITY_MCP_HTTP_HOST"] = http_host
     os.environ["UNITY_MCP_HTTP_PORT"] = str(http_port)
+
+    if args.ephemeral:
+        if config.http_remote_hosted:
+            logger.warning(
+                "--ephemeral is ignored when --http-remote-hosted is set; "
+                "remote-hosted servers are not user-owned and must not self-terminate"
+            )
+        else:
+            config.ephemeral_mode = True
 
     # Optional lifecycle handshake for Unity-managed terminal launches
     if args.unity_instance_token:

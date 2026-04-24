@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import time
 import uuid
 import weakref
@@ -30,9 +31,14 @@ from transport.models import (
     RegisterToolsMessage,
     PongMessage,
     CommandResultMessage,
+    ExpectReconnectMessage,
     SessionList,
     SessionDetails,
 )
+
+# Shared by cold-start grace and reconnect-deadline expiry — both express the same
+# intent: wait this long for an instance to (re)connect before exiting.
+RECONNECT_GRACE_SECONDS = 300.0
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +127,10 @@ class PluginHub(WebSocketEndpoint):
     _last_pong: ClassVar[dict[str, float]] = {}
     # session_id -> ping task
     _ping_tasks: ClassVar[dict[str, asyncio.Task]] = {}
+    # Lifecycle state for ephemeral mode
+    _reconnect_deadlines: ClassVar[dict[str, float]] = {}
+    _exit_task: ClassVar[asyncio.Task | None] = None
+    _has_ever_connected: ClassVar[bool] = False
 
     @classmethod
     def configure(
@@ -137,10 +147,94 @@ class PluginHub(WebSocketEndpoint):
         # Start tracking MCP client sessions for tool-change notifications
         if mcp is not None:
             _install_session_tracking()
+        cls._evaluate_exit()
 
     @classmethod
     def is_configured(cls) -> bool:
         return cls._registry is not None and cls._lock is not None
+
+    # ------------------------------------------------------------------
+    # Ephemeral shutdown: exit when no Unity plugins remain (intent-based)
+    # ------------------------------------------------------------------
+    @classmethod
+    def _ephemeral_active(cls) -> bool:
+        """Whether intent-based shutdown applies to this process."""
+        return (
+            config.transport_mode == "http"
+            and not config.http_remote_hosted
+            and config.ephemeral_mode
+        )
+
+    @classmethod
+    def _drop_expired_deadlines(cls) -> None:
+        now = time.monotonic()
+        expired = [h for h, deadline in cls._reconnect_deadlines.items() if deadline <= now]
+        for h in expired:
+            cls._reconnect_deadlines.pop(h, None)
+            logger.info("Reconnect deadline expired for project_hash=%s", h)
+
+    @classmethod
+    def _evaluate_exit(cls) -> None:
+        """Decide whether to schedule (or skip) an exit watchdog. Caller must hold ``_lock`` for steady-state calls (startup is safe without)."""
+        if not cls._ephemeral_active():
+            return
+
+        if len(cls._connections) > 0:
+            cls._cancel_exit()
+            return
+
+        cls._drop_expired_deadlines()
+
+        if cls._reconnect_deadlines:
+            # Re-check at the soonest reconnect deadline.
+            soonest = min(cls._reconnect_deadlines.values())
+            delay = max(0.1, soonest - time.monotonic())
+            cls._schedule_exit(delay, reason="reconnect deadline")
+            return
+
+        if not cls._has_ever_connected:
+            cls._schedule_exit(RECONNECT_GRACE_SECONDS, reason="cold-start grace")
+            return
+
+        # No connections and no live reconnect deadlines: exit now.
+        cls._exit_now("session ended; no pending reconnects")
+
+    @classmethod
+    def _schedule_exit(cls, delay: float, reason: str) -> None:
+        if cls._exit_task is not None and not cls._exit_task.done():
+            cls._exit_task.cancel()
+        cls._exit_task = asyncio.create_task(cls._exit_after(delay))
+        logger.info(
+            "Server will exit in %.0fs unless an instance (re)connects (%s)",
+            delay,
+            reason,
+        )
+
+    @classmethod
+    def _cancel_exit(cls) -> None:
+        if cls._exit_task is not None:
+            if not cls._exit_task.done():
+                cls._exit_task.cancel()
+            cls._exit_task = None
+
+    @classmethod
+    async def _exit_after(cls, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        lock = cls._lock
+        if lock is None:
+            return
+        async with lock:
+            cls._evaluate_exit()
+
+    @classmethod
+    def _exit_now(cls, reason: str) -> None:
+        logger.info("Shutting down server: %s", reason)
+        # signal.raise_signal() invokes registered handlers on all platforms;
+        # os.kill() on Windows would TerminateProcess without cleanup.
+        signal.raise_signal(signal.SIGTERM)
 
     async def on_connect(self, websocket: WebSocket) -> None:
         # Validate API key in remote-hosted mode (fail closed)
@@ -191,6 +285,8 @@ class PluginHub(WebSocketEndpoint):
         msg = WelcomeMessage(
             serverTimeout=self.SERVER_TIMEOUT,
             keepAliveInterval=self.KEEP_ALIVE_INTERVAL,
+            ephemeral=config.ephemeral_mode,
+            httpRemoteHosted=config.http_remote_hosted,
         )
         await websocket.send_json(msg.model_dump())
 
@@ -209,6 +305,8 @@ class PluginHub(WebSocketEndpoint):
                 await self._handle_pong(PongMessage(**data))
             elif message_type == "command_result":
                 await self._handle_command_result(CommandResultMessage(**data))
+            elif message_type == "expect_reconnect":
+                await self._handle_expect_reconnect(ExpectReconnectMessage(**data))
             else:
                 logger.debug(f"Ignoring plugin message: {data}")
         except Exception as e:
@@ -252,6 +350,8 @@ class PluginHub(WebSocketEndpoint):
                     await cls._registry.unregister(session_id)
                 logger.info(
                     f"Plugin session {session_id} disconnected ({close_code})")
+
+            cls._evaluate_exit()
 
     # ------------------------------------------------------------------
     # Public API
@@ -458,6 +558,11 @@ class PluginHub(WebSocketEndpoint):
                 logger.info(f"Evicted previous session {evicted_session_id} for same instance")
 
             cls._connections[session.session_id] = websocket
+            cls._has_ever_connected = True
+            if project_hash in cls._reconnect_deadlines:
+                cls._reconnect_deadlines.pop(project_hash, None)
+                logger.debug("Cleared pending reconnect for project_hash=%s on register", project_hash)
+            cls._cancel_exit()
             # Initialize last pong time and start ping loop for this session
             cls._last_pong[session_id] = time.monotonic()
             # Cancel any existing ping task for this session (shouldn't happen, but be safe)
@@ -645,6 +750,30 @@ class PluginHub(WebSocketEndpoint):
         future = entry.get("future") if isinstance(entry, dict) else None
         if future and not future.done():
             future.set_result(result)
+
+    async def _handle_expect_reconnect(self, payload: ExpectReconnectMessage) -> None:
+        cls = type(self)
+        registry = cls._registry
+        lock = cls._lock
+        if registry is None or lock is None:
+            return
+        session_id = payload.session_id
+        session = await registry.get_session(session_id)
+        if session is None:
+            logger.warning("expect_reconnect for unknown session %s", session_id)
+            return
+        project_hash = session.project_hash
+        async with lock:
+            cls._reconnect_deadlines[project_hash] = (
+                time.monotonic() + RECONNECT_GRACE_SECONDS
+            )
+            cls._evaluate_exit()
+        logger.info(
+            "Instance %s announced expected reconnect (reason=%s) deadline=+%.0fs",
+            project_hash,
+            payload.reason,
+            RECONNECT_GRACE_SECONDS,
+        )
 
     async def _handle_pong(self, payload: PongMessage) -> None:
         cls = type(self)

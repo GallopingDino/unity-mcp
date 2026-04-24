@@ -6,6 +6,7 @@ using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Models;
 using MCPForUnity.Editor.Services;
 using MCPForUnity.Editor.Services.Transport;
+using MCPForUnity.Editor.Services.Transport.Transports;
 using UnityEditor;
 using UnityEditor.UIElements;
 using UnityEngine;
@@ -592,6 +593,23 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                 localServerRunning = lastLocalServerRunning;
             }
 
+            // Hide the Stop Server button entirely when the connected server is ephemeral
+            // or remote-hosted — those servers self-terminate (or are not user-owned),
+            // so "End Session" is the only safe primary action. Default to hidden until
+            // the welcome message arrives so we never offer a destructive action prematurely.
+            bool hideStopServer = httpLocalSelected
+                && localServerRunning
+                && IsServerEphemeralOrHostedOrUnknown();
+            if (hideStopServer)
+            {
+                startHttpServerButton.style.display = DisplayStyle.None;
+                return;
+            }
+            if (httpLocalSelected)
+            {
+                startHttpServerButton.style.display = DisplayStyle.Flex;
+            }
+
             // Server button only controls server lifecycle (Start/Stop Server).
             // Session lifecycle is handled by the separate connectionToggleButton.
             bool shouldShowStop = localServerRunning;
@@ -606,6 +624,19 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                     ? string.Empty
                     : localUrlError ?? $"HTTP Local requires a loopback URL ({HttpEndpointUtility.GetHttpLocalHostRequirementText()}).")
                 : string.Empty;
+        }
+
+        private bool IsServerEphemeralOrHostedOrUnknown()
+        {
+            // Source of truth is the welcome message. Until it arrives, default to
+            // "single-button" UI — never expose Stop Server prematurely.
+            var client = MCPServiceLocator.TransportManager.GetClient(TransportMode.Http)
+                as WebSocketTransportClient;
+            if (client == null || !client.WelcomeReceived)
+            {
+                return true;
+            }
+            return client.ServerEphemeral || client.ServerHttpRemoteHosted;
         }
 
         private void RefreshHttpUi()

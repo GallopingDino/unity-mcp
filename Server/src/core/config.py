@@ -54,6 +54,10 @@ class ServerConfig:
     # 40 × 250ms ≈ 10s default window
     reload_max_retries: int = 40
 
+    # Ephemeral mode (HTTP local). Server self-terminates when no Unity instances remain.
+    # See transport.plugin_hub for shutdown semantics.
+    ephemeral_mode: bool = False
+
     # Port discovery cache
     port_registry_ttl: float = 5.0
 

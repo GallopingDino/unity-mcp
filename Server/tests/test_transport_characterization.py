@@ -96,6 +96,11 @@ async def configured_plugin_hub(plugin_registry):
     PluginHub._loop = None
     PluginHub._connections.clear()
     PluginHub._pending.clear()
+    if PluginHub._exit_task is not None:
+        if not PluginHub._exit_task.done():
+            PluginHub._exit_task.cancel()
+        PluginHub._exit_task = None
+    PluginHub._reconnect_deadlines.clear()
 
 
 # ============================================================================

@@ -60,6 +60,9 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private TransportState _state = TransportState.Disconnected(TransportDisplayName, "Transport not started");
         private string _apiKey;
         private bool _disposed;
+        private volatile bool _serverEphemeral;
+        private volatile bool _serverHttpRemoteHosted;
+        private volatile bool _welcomeReceived;
 
         public WebSocketTransportClient(IToolDiscoveryService toolDiscoveryService = null)
         {
@@ -69,6 +72,15 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         public bool IsConnected => _isConnected;
         public string TransportName => TransportDisplayName;
         public TransportState State => _state;
+
+        /// <summary>Server self-reported ephemeral lifecycle (true → simplified UI).</summary>
+        public bool ServerEphemeral => _serverEphemeral;
+
+        /// <summary>Server self-reported as remote-hosted (true → simplified UI).</summary>
+        public bool ServerHttpRemoteHosted => _serverHttpRemoteHosted;
+
+        /// <summary>True after the first welcome message has been processed.</summary>
+        public bool WelcomeReceived => _welcomeReceived;
 
         private Task<List<ToolMetadata>> GetEnabledToolsOnMainThreadAsync(CancellationToken token)
         {
@@ -163,6 +175,9 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             _isConnected = false;
             _state = TransportState.Disconnected(TransportDisplayName);
+            _welcomeReceived = false;
+            _serverEphemeral = false;
+            _serverHttpRemoteHosted = false;
 
             _lifecycleCts.Dispose();
             _lifecycleCts = null;
@@ -192,9 +207,51 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             Interlocked.Exchange(ref _isReconnectingFlag, 0);
             _isConnected = false;
             _state = TransportState.Disconnected(TransportDisplayName);
+            _welcomeReceived = false;
+            _serverEphemeral = false;
+            _serverHttpRemoteHosted = false;
 
             try { _lifecycleCts?.Dispose(); } catch { }
             _lifecycleCts = null;
+        }
+
+        /// <summary>
+        /// Best-effort synchronous send used in <c>beforeAssemblyReload</c>, where
+        /// async is not honored. Waits up to <paramref name="timeoutMs"/>ms for
+        /// the bytes to leave the socket; if the send times out, the caller
+        /// proceeds with <see cref="ForceStop"/> and the server will treat the
+        /// disconnect as a session end.
+        /// </summary>
+        public bool TrySendExpectReconnectSync(string reason, int timeoutMs = 200)
+        {
+            if (_socket == null || _socket.State != WebSocketState.Open)
+            {
+                return false;
+            }
+            string sessionId = _sessionId;
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                return false;
+            }
+
+            var payload = new JObject
+            {
+                ["type"] = "expect_reconnect",
+                ["reason"] = reason,
+                ["session_id"] = sessionId
+            };
+            byte[] bytes = Encoding.UTF8.GetBytes(payload.ToString(Formatting.None));
+            var buffer = new ArraySegment<byte>(bytes);
+
+            try
+            {
+                Task sendTask = _socket.SendAsync(buffer, WebSocketMessageType.Text, true, CancellationToken.None);
+                return sendTask.Wait(TimeSpan.FromMilliseconds(timeoutMs));
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         public async Task<bool> VerifyAsync()
@@ -506,6 +563,10 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 int safeSeconds = Math.Max(5, Math.Min(serverTimeoutSeconds.Value, sourceSeconds));
                 _socketKeepAliveInterval = TimeSpan.FromSeconds(safeSeconds);
             }
+
+            _serverEphemeral = payload.Value<bool?>("ephemeral") ?? false;
+            _serverHttpRemoteHosted = payload.Value<bool?>("httpRemoteHosted") ?? false;
+            _welcomeReceived = true;
         }
 
         private async Task HandleRegisteredAsync(JObject payload, CancellationToken token)

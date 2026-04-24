@@ -3,6 +3,7 @@ using System.Threading.Tasks;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services.Transport;
+using MCPForUnity.Editor.Services.Transport.Transports;
 using MCPForUnity.Editor.Windows;
 using UnityEditor;
 
@@ -40,17 +41,25 @@ namespace MCPForUnity.Editor.Services
                 if (shouldResume)
                 {
                     EditorPrefs.SetBool(EditorPrefKeys.ResumeHttpAfterReload, true);
+
+                    // Tell the server we're reloading so it holds the connection slot open
+                    // for the reconnect (instead of treating this disconnect as a session end).
+                    if (transport.GetClient(TransportMode.Http) is WebSocketTransportClient ws)
+                    {
+                        try { ws.TrySendExpectReconnectSync(reason: "domain_reload", timeoutMs: 200); }
+                        catch (Exception ex)
+                        {
+                            McpLog.Debug($"expect_reconnect send failed; server will fall back to session-end on disconnect: {ex.Message}");
+                        }
+                    }
+
+                    // beforeAssemblyReload is synchronous; force a synchronous teardown so we do not
+                    // leave an orphaned socket due to an unfinished async close handshake.
+                    transport.ForceStop(TransportMode.Http);
                 }
                 else
                 {
                     EditorPrefs.DeleteKey(EditorPrefKeys.ResumeHttpAfterReload);
-                }
-
-                if (shouldResume)
-                {
-                    // beforeAssemblyReload is synchronous; force a synchronous teardown so we do not
-                    // leave an orphaned socket due to an unfinished async close handshake.
-                    transport.ForceStop(TransportMode.Http);
                 }
             }
             catch (Exception ex)

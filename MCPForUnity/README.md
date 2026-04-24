@@ -36,6 +36,7 @@ The window has four areas: Server Status, Unity Bridge, MCP Client Configuration
 - HTTP Server Command foldout:
   - Expands to display the exact `uvx` command Unity will run.
   - Includes a copy button and the “Start Local HTTP Server” action so you can launch or reuse the command elsewhere.
+  - When started via this action, Unity adds `--ephemeral` so the server self-terminates when no Unity instances remain connected. A 300s reload grace lets the server survive domain reloads, and a matching cold-start grace keeps it alive while Unity is still connecting for the first time.
 
 ---
 

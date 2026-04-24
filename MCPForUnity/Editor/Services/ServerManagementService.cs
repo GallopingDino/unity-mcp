@@ -289,8 +289,9 @@ namespace MCPForUnity.Editor.Services
             string launchCommand = displayCommand;
             if (!string.IsNullOrEmpty(pidFilePath))
             {
-                launchCommand = $"{displayCommand} --pidfile {QuoteIfNeeded(pidFilePath)} --unity-instance-token {instanceToken}";
+                launchCommand += $" --pidfile {QuoteIfNeeded(pidFilePath)} --unity-instance-token {instanceToken}";
             }
+            launchCommand += " --ephemeral";
 
             if (!quiet && !EditorUtility.DisplayDialog(
                 "Start Local HTTP Server",
@@ -347,33 +348,6 @@ namespace MCPForUnity.Editor.Services
         public bool StopLocalHttpServer()
         {
             return StopLocalHttpServerInternal(quiet: false);
-        }
-
-        public bool StopManagedLocalHttpServer()
-        {
-            if (!TryGetLocalHttpServerHandshake(out var pidFilePath, out _))
-            {
-                return false;
-            }
-
-            int port = 0;
-            if (!TryGetPortFromPidFilePath(pidFilePath, out port) || port <= 0)
-            {
-                string baseUrl = HttpEndpointUtility.GetLocalBaseUrl();
-                if (IsLocalUrl(baseUrl)
-                    && Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)
-                    && uri.Port > 0)
-                {
-                    port = uri.Port;
-                }
-            }
-
-            if (port <= 0)
-            {
-                return false;
-            }
-
-            return StopLocalHttpServerInternal(quiet: true, portOverride: port, allowNonLocalUrl: true);
         }
 
         public bool IsLocalHttpServerRunning()
@@ -839,11 +813,6 @@ namespace MCPForUnity.Editor.Services
         private bool TryGetUnixProcessArgs(int pid, out string argsLower)
         {
             return _processDetector.TryGetProcessCommandLine(pid, out argsLower);
-        }
-
-        private bool TryGetPortFromPidFilePath(string pidFilePath, out int port)
-        {
-            return _pidFileManager.TryGetPortFromPidFilePath(pidFilePath, out port);
         }
 
         private void DeletePidFile(string pidFilePath)

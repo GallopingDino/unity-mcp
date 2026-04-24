@@ -9,6 +9,8 @@ class WelcomeMessage(BaseModel):
     type: str = "welcome"
     serverTimeout: int
     keepAliveInterval: int
+    ephemeral: bool = False
+    httpRemoteHosted: bool = False
 
 
 class RegisteredMessage(BaseModel):
@@ -47,6 +49,12 @@ class RegisterToolsMessage(BaseModel):
 class PongMessage(BaseModel):
     type: str = "pong"
     session_id: str | None = None
+
+
+class ExpectReconnectMessage(BaseModel):
+    type: str = "expect_reconnect"
+    session_id: str
+    reason: str
 
 
 class CommandResultMessage(BaseModel):
