@@ -36,7 +36,20 @@ namespace MCPForUnity.Editor.Services
             try
             {
                 var transport = MCPServiceLocator.TransportManager;
-                bool shouldResume = transport.IsRunning(TransportMode.Http);
+                var httpClient = transport.GetClient(TransportMode.Http);
+
+                // TransportManager._httpState is updated only when the StartAsync continuation
+                // resumes on the captured SynchronizationContext. If beforeAssemblyReload fires
+                // while that continuation is still queued (e.g. a second domain reload arriving
+                // 1-2s after the first reconnect), the manager-level flag is still false even
+                // though the WebSocket is already open and the session is registered. Fall back
+                // to the client's own liveness so we still send expect_reconnect in that window.
+                bool managerRunning = transport.IsRunning(TransportMode.Http);
+                bool clientHasLiveSession = httpClient is WebSocketTransportClient liveWs && liveWs.HasLiveSession;
+                bool shouldResume = managerRunning || clientHasLiveSession;
+                McpDiagnosticLog.Info(
+                    "Resume",
+                    $"OnBeforeAssemblyReload httpRunning={managerRunning} hasLiveSession={clientHasLiveSession} shouldResume={shouldResume}");
 
                 if (shouldResume)
                 {
@@ -44,17 +57,27 @@ namespace MCPForUnity.Editor.Services
 
                     // Tell the server we're reloading so it holds the connection slot open
                     // for the reconnect (instead of treating this disconnect as a session end).
-                    if (transport.GetClient(TransportMode.Http) is WebSocketTransportClient ws)
+                    if (httpClient is WebSocketTransportClient ws)
                     {
-                        try { ws.TrySendExpectReconnectSync(reason: "domain_reload", timeoutMs: 200); }
+                        try
+                        {
+                            bool sent = ws.TrySendExpectReconnectSync(reason: "domain_reload", timeoutMs: 200);
+                            McpDiagnosticLog.Info("Resume", $"expect_reconnect send result={sent} welcome={ws.WelcomeReceived}");
+                        }
                         catch (Exception ex)
                         {
                             McpLog.Debug($"expect_reconnect send failed; server will fall back to session-end on disconnect: {ex.Message}");
+                            McpDiagnosticLog.Exception("Resume", "expect_reconnect threw", ex);
                         }
+                    }
+                    else
+                    {
+                        McpDiagnosticLog.Warn("Resume", "OnBeforeAssemblyReload: HTTP client is not WebSocketTransportClient — cannot send expect_reconnect");
                     }
 
                     // beforeAssemblyReload is synchronous; force a synchronous teardown so we do not
                     // leave an orphaned socket due to an unfinished async close handshake.
+                    McpDiagnosticLog.Info("Resume", "calling ForceStop(Http) to abort socket synchronously");
                     transport.ForceStop(TransportMode.Http);
                 }
                 else
@@ -65,6 +88,7 @@ namespace MCPForUnity.Editor.Services
             catch (Exception ex)
             {
                 McpLog.Warn($"Failed to evaluate HTTP bridge reload state: {ex.Message}");
+                McpDiagnosticLog.Exception("Resume", "OnBeforeAssemblyReload threw", ex);
             }
         }
 
@@ -76,6 +100,7 @@ namespace MCPForUnity.Editor.Services
                 // Only resume HTTP if it is still the selected transport.
                 bool useHttp = EditorConfigurationCache.Instance.UseHttpTransport;
                 resume = useHttp && EditorPrefs.GetBool(EditorPrefKeys.ResumeHttpAfterReload, false);
+                McpDiagnosticLog.Info("Resume", $"OnAfterAssemblyReload useHttp={useHttp} resumeFlag={resume}");
                 if (resume)
                 {
                     EditorPrefs.DeleteKey(EditorPrefKeys.ResumeHttpAfterReload);
@@ -84,6 +109,7 @@ namespace MCPForUnity.Editor.Services
             catch (Exception ex)
             {
                 McpLog.Warn($"Failed to read HTTP bridge reload flag: {ex.Message}");
+                McpDiagnosticLog.Exception("Resume", "OnAfterAssemblyReload flag read failed", ex);
                 resume = false;
             }
 
@@ -144,6 +170,7 @@ namespace MCPForUnity.Editor.Services
                     if (started)
                     {
                         McpLog.Debug($"[HTTP Reload] Resume succeeded on attempt {attempt}");
+                        McpDiagnosticLog.Info("Resume", $"resume succeeded attempt={attempt}");
                         MCPForUnityEditorWindow.RequestHealthVerification();
                         return;
                     }
@@ -151,21 +178,25 @@ namespace MCPForUnity.Editor.Services
                     var state = MCPServiceLocator.TransportManager.GetState(TransportMode.Http);
                     string reason = string.IsNullOrWhiteSpace(state?.Error) ? "no error detail" : state.Error;
                     McpLog.Debug($"[HTTP Reload] Resume attempt {attempt} failed: {reason}");
+                    McpDiagnosticLog.Warn("Resume", $"resume attempt {attempt} failed: {reason}");
                 }
                 catch (Exception ex)
                 {
                     lastException = ex;
                     McpLog.Debug($"[HTTP Reload] Resume attempt {attempt} threw: {ex.Message}");
+                    McpDiagnosticLog.Exception("Resume", $"resume attempt {attempt} threw", ex);
                 }
             }
 
             if (lastException != null)
             {
                 McpLog.Warn($"Failed to resume HTTP MCP bridge after domain reload: {lastException.Message}");
+                McpDiagnosticLog.Exception("Resume", "all resume attempts exhausted", lastException);
             }
             else
             {
                 McpLog.Warn("Failed to resume HTTP MCP bridge after domain reload");
+                McpDiagnosticLog.Error("Resume", "all resume attempts exhausted (no exception captured)");
             }
         }
     }

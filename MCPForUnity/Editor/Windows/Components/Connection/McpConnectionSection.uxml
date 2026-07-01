@@ -29,6 +29,7 @@
             </ui:VisualElement>
             <ui:VisualElement class="setting-row" name="http-server-control-row">
                 <ui:Label text="Local Server:" class="setting-label" />
+                <ui:Label name="local-server-status-text" class="setting-value local-server-status" />
                 <ui:Button name="start-http-server-button" text="Start Server" class="action-button start-server-button" />
             </ui:VisualElement>
             <ui:VisualElement class="setting-row" name="unity-socket-port-row">

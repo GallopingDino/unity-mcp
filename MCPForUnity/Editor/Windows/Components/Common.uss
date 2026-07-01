@@ -213,6 +213,12 @@
     margin-left: 0px;
 }
 
+/* Status label that replaces the Start/Stop Server button in ephemeral/auto-managed mode */
+.local-server-status {
+    -unity-font-style: italic;
+    margin-right: 4px;
+}
+
 /* When the HTTP server/session is running, we show the Start/Stop button as "danger" (red) */
 .action-button.server-running {
     background-color: rgba(200, 50, 50, 0.85);

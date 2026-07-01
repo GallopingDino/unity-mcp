@@ -57,6 +57,12 @@ class ExpectReconnectMessage(BaseModel):
     reason: str
 
 
+class SessionEndMessage(BaseModel):
+    type: str = "session_end"
+    session_id: str
+    reason: str = "editor_quit"
+
+
 class CommandResultMessage(BaseModel):
     type: str = "command_result"
     id: str

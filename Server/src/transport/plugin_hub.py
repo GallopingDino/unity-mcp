@@ -9,6 +9,7 @@ import signal
 import time
 import uuid
 import weakref
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from starlette.endpoints import WebSocketEndpoint
@@ -32,15 +33,28 @@ from transport.models import (
     PongMessage,
     CommandResultMessage,
     ExpectReconnectMessage,
+    SessionEndMessage,
     SessionList,
     SessionDetails,
 )
 
-# Shared by cold-start grace and reconnect-deadline expiry — both express the same
-# intent: wait this long for an instance to (re)connect before exiting.
+# Shared by cold-start grace and announced-reconnect deadline (e.g. domain reload):
+# the instance has explicitly told us it will be back, so we wait long.
 RECONNECT_GRACE_SECONDS = 300.0
 
+# Used when the disconnect was *not* announced but is also not a clean stop:
+# server-initiated stale-ping close, abnormal transport failures. Sized to
+# comfortably cover Unity's reconnect schedule {0,1,3,5,10,30}s without
+# turning an ephemeral server into a long-lived background process.
+TRANSPORT_RECOVERY_GRACE_SECONDS = 60.0
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _ReconnectInfo:
+    deadline: float
+    reason: str  # "announced" | "stale_ping" | "abnormal_disconnect"
 
 # ---------- MCP session tracking ----------
 # FastMCP doesn't expose active MCP client sessions.  We patch
@@ -128,9 +142,17 @@ class PluginHub(WebSocketEndpoint):
     # session_id -> ping task
     _ping_tasks: ClassVar[dict[str, asyncio.Task]] = {}
     # Lifecycle state for ephemeral mode
-    _reconnect_deadlines: ClassVar[dict[str, float]] = {}
+    _reconnect_deadlines: ClassVar[dict[str, _ReconnectInfo]] = {}
+    # session_id -> close cause label set by the actor that initiates the close
+    # ("stale_ping", "superseded", "session_end"). on_disconnect consumes it to
+    # classify the disconnect; absence + non-1000 close_code is treated as
+    # abnormal. "session_end" is set by the client via an explicit message
+    # before closing (e.g. on editor quit) so the server can tell a clean
+    # shutdown from a transient 1005 caused by a reload mid-handshake.
+    _session_close_causes: ClassVar[dict[str, str]] = {}
     _exit_task: ClassVar[asyncio.Task | None] = None
     _has_ever_connected: ClassVar[bool] = False
+    _cold_start_grace_used: ClassVar[bool] = False
 
     @classmethod
     def configure(
@@ -168,10 +190,11 @@ class PluginHub(WebSocketEndpoint):
     @classmethod
     def _drop_expired_deadlines(cls) -> None:
         now = time.monotonic()
-        expired = [h for h, deadline in cls._reconnect_deadlines.items() if deadline <= now]
+        expired = [h for h, info in cls._reconnect_deadlines.items() if info.deadline <= now]
         for h in expired:
-            cls._reconnect_deadlines.pop(h, None)
-            logger.info("Reconnect deadline expired for project_hash=%s", h)
+            info = cls._reconnect_deadlines.pop(h, None)
+            reason = info.reason if info is not None else "unknown"
+            logger.info("Reconnect deadline expired for project_hash=%s reason=%s", h, reason)
 
     @classmethod
     def _evaluate_exit(cls) -> None:
@@ -187,12 +210,19 @@ class PluginHub(WebSocketEndpoint):
 
         if cls._reconnect_deadlines:
             # Re-check at the soonest reconnect deadline.
-            soonest = min(cls._reconnect_deadlines.values())
-            delay = max(0.1, soonest - time.monotonic())
-            cls._schedule_exit(delay, reason="reconnect deadline")
+            soonest_info = min(cls._reconnect_deadlines.values(), key=lambda i: i.deadline)
+            delay = max(0.1, soonest_info.deadline - time.monotonic())
+            cls._schedule_exit(delay, reason=f"reconnect deadline ({soonest_info.reason})")
             return
 
         if not cls._has_ever_connected:
+            # Cold-start grace fires exactly once. If it has already been
+            # scheduled and we are back here without anyone connecting,
+            # the server is unwanted — exit instead of re-scheduling.
+            if cls._cold_start_grace_used:
+                cls._exit_now("cold-start grace expired without any connection")
+                return
+            cls._cold_start_grace_used = True
             cls._schedule_exit(RECONNECT_GRACE_SECONDS, reason="cold-start grace")
             return
 
@@ -307,6 +337,8 @@ class PluginHub(WebSocketEndpoint):
                 await self._handle_command_result(CommandResultMessage(**data))
             elif message_type == "expect_reconnect":
                 await self._handle_expect_reconnect(ExpectReconnectMessage(**data))
+            elif message_type == "session_end":
+                await self._handle_session_end(SessionEndMessage(**data))
             else:
                 logger.debug(f"Ignoring plugin message: {data}")
         except Exception as e:
@@ -320,7 +352,17 @@ class PluginHub(WebSocketEndpoint):
         async with lock:
             session_id = next(
                 (sid for sid, ws in cls._connections.items() if ws is websocket), None)
+            project_hash: str | None = None
+            cause: str | None = None
             if session_id:
+                cause = cls._session_close_causes.pop(session_id, None)
+                # Resolve project_hash *before* unregistering so we can schedule a
+                # transport-recovery grace if needed.
+                if cls._registry is not None:
+                    session = await cls._registry.get_session(session_id)
+                    if session is not None:
+                        project_hash = session.project_hash
+
                 cls._connections.pop(session_id, None)
                 # Stop the ping loop for this session
                 ping_task = cls._ping_tasks.pop(session_id, None)
@@ -350,6 +392,39 @@ class PluginHub(WebSocketEndpoint):
                     await cls._registry.unregister(session_id)
                 logger.info(
                     f"Plugin session {session_id} disconnected ({close_code})")
+
+            # Decide whether this disconnect deserves a short transport-recovery
+            # grace. We add one for server-initiated stale closes and any other
+            # abnormal disconnect that wasn't a clean stop or a supersede; we
+            # never downgrade an already-pending announced reconnect.
+            #
+            # Note: only close_code == 1000 is treated as a clean session end
+            # purely from the close code. In particular 1005 (NoStatusReceived)
+            # is ambiguous on its own — it covers both editor-quit and the
+            # `ForceStop`/`_socket.Abort()` path used when a reload-time
+            # `expect_reconnect` send times out. The latter is a transient
+            # disconnect that must be allowed to recover, so the client must
+            # disambiguate by sending an explicit `session_end` message before
+            # closing on quit; that sets cause == "session_end" here.
+            if (
+                cls._ephemeral_active()
+                and project_hash
+                and cause not in ("superseded", "session_end")
+            ):
+                normal_close = cause is None and close_code == 1000
+                existing = cls._reconnect_deadlines.get(project_hash)
+                if not normal_close and (existing is None or existing.reason != "announced"):
+                    recovery_reason = cause if cause == "stale_ping" else "abnormal_disconnect"
+                    cls._reconnect_deadlines[project_hash] = _ReconnectInfo(
+                        deadline=time.monotonic() + TRANSPORT_RECOVERY_GRACE_SECONDS,
+                        reason=recovery_reason,
+                    )
+                    logger.info(
+                        "Scheduled transport recovery grace for project_hash=%s reason=%s deadline=+%.0fs",
+                        project_hash,
+                        recovery_reason,
+                        TRANSPORT_RECOVERY_GRACE_SECONDS,
+                    )
 
             cls._evaluate_exit()
 
@@ -532,6 +607,10 @@ class PluginHub(WebSocketEndpoint):
             # Clean up the evicted session's connection, ping loop, and pending commands
             # so they don't linger as orphans after a domain-reload reconnection race.
             if evicted_session_id:
+                # Mark the evicted session so its on_disconnect doesn't schedule a
+                # transport-recovery grace — the new session for the same project_hash
+                # has already taken its place.
+                cls._session_close_causes[evicted_session_id] = "superseded"
                 evicted_ws = cls._connections.pop(evicted_session_id, None)
                 old_ping = cls._ping_tasks.pop(evicted_session_id, None)
                 if old_ping and not old_ping.done():
@@ -559,9 +638,13 @@ class PluginHub(WebSocketEndpoint):
 
             cls._connections[session.session_id] = websocket
             cls._has_ever_connected = True
-            if project_hash in cls._reconnect_deadlines:
-                cls._reconnect_deadlines.pop(project_hash, None)
-                logger.debug("Cleared pending reconnect for project_hash=%s on register", project_hash)
+            cleared_info = cls._reconnect_deadlines.pop(project_hash, None)
+            if cleared_info is not None:
+                logger.info(
+                    "Cleared pending reconnect for project_hash=%s reason=%s on register",
+                    project_hash,
+                    cleared_info.reason,
+                )
             cls._cancel_exit()
             # Initialize last pong time and start ping loop for this session
             cls._last_pong[session_id] = time.monotonic()
@@ -764,8 +847,9 @@ class PluginHub(WebSocketEndpoint):
             return
         project_hash = session.project_hash
         async with lock:
-            cls._reconnect_deadlines[project_hash] = (
-                time.monotonic() + RECONNECT_GRACE_SECONDS
+            cls._reconnect_deadlines[project_hash] = _ReconnectInfo(
+                deadline=time.monotonic() + RECONNECT_GRACE_SECONDS,
+                reason="announced",
             )
             cls._evaluate_exit()
         logger.info(
@@ -773,6 +857,28 @@ class PluginHub(WebSocketEndpoint):
             project_hash,
             payload.reason,
             RECONNECT_GRACE_SECONDS,
+        )
+
+    async def _handle_session_end(self, payload: SessionEndMessage) -> None:
+        """Mark a session as cleanly ending so on_disconnect skips the recovery grace.
+
+        Counterpart to ``expect_reconnect``: the client sends this just before
+        closing its socket on quit so the server treats the imminent disconnect
+        as session-end regardless of the resulting WebSocket close code (which
+        is frequently 1005 because the close-frame doesn't reliably flush before
+        the Editor process exits).
+        """
+        cls = type(self)
+        lock = cls._lock
+        if lock is None:
+            return
+        session_id = payload.session_id
+        async with lock:
+            cls._session_close_causes[session_id] = "session_end"
+        logger.info(
+            "Plugin session %s announced clean session end (reason=%s)",
+            session_id,
+            payload.reason,
         )
 
     async def _handle_pong(self, payload: PongMessage) -> None:
@@ -820,6 +926,10 @@ class PluginHub(WebSocketEndpoint):
                         f"[Ping] Session {session_id} stale: no pong for {elapsed:.1f}s "
                         f"(timeout={cls.PING_TIMEOUT}s). Closing connection."
                     )
+                    # Tag the session so on_disconnect schedules a short transport
+                    # recovery grace instead of treating this as session-end.
+                    async with lock:
+                        cls._session_close_causes[session_id] = "stale_ping"
                     try:
                         await websocket.close(code=1001)  # Going away
                     except Exception as close_ex:

@@ -540,6 +540,7 @@ namespace MCPForUnity.Editor.Windows
                 return;
 
             connectionSection?.UpdateConnectionStatus();
+            connectionSection?.EvaluateAutoConnect();
         }
 
         private void RefreshAllData()

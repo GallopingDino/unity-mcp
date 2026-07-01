@@ -33,6 +33,11 @@
             </ui:VisualElement>
 
             <ui:VisualElement class="setting-row">
+                <ui:Label text="Diagnostic Log (Library/MCPForUnity/Logs/diagnostic.log):" class="setting-label" />
+                <ui:Toggle name="diagnostic-log-toggle" class="setting-toggle" />
+            </ui:VisualElement>
+
+            <ui:VisualElement class="setting-row">
                 <ui:Label text="Server Health:" class="setting-label" />
                 <ui:VisualElement class="status-container">
                     <ui:VisualElement name="health-indicator" class="status-dot" />

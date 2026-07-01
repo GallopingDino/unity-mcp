@@ -28,6 +28,7 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
         private Toggle autoStartOnLoadToggle;
         private Toggle debugLogsToggle;
         private Toggle logRecordToggle;
+        private Toggle diagnosticLogToggle;
         private Toggle devModeForceRefreshToggle;
         private Toggle allowLanHttpBindToggle;
         private Toggle allowInsecureRemoteHttpToggle;
@@ -71,6 +72,7 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             autoStartOnLoadToggle = Root.Q<Toggle>("auto-start-on-load-toggle");
             debugLogsToggle = Root.Q<Toggle>("debug-logs-toggle");
             logRecordToggle = Root.Q<Toggle>("log-record-toggle");
+            diagnosticLogToggle = Root.Q<Toggle>("diagnostic-log-toggle");
             devModeForceRefreshToggle = Root.Q<Toggle>("dev-mode-force-refresh-toggle");
             allowLanHttpBindToggle = Root.Q<Toggle>("allow-lan-http-bind-toggle");
             allowInsecureRemoteHttpToggle = Root.Q<Toggle>("allow-insecure-remote-http-toggle");
@@ -100,6 +102,13 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                 var debugLabel = debugLogsToggle?.parent?.Q<Label>();
                 if (debugLabel != null)
                     debugLabel.tooltip = debugLogsToggle.tooltip;
+            }
+            if (diagnosticLogToggle != null)
+            {
+                diagnosticLogToggle.tooltip = "Append transport, domain reload, compilation and editor lifecycle events to Library/MCPForUnity/Logs/diagnostic.log. Use this to debug MCP server disconnects post-mortem.";
+                var diagnosticLogLabel = diagnosticLogToggle?.parent?.Q<Label>();
+                if (diagnosticLogLabel != null)
+                    diagnosticLogLabel.tooltip = diagnosticLogToggle.tooltip;
             }
             if (logRecordToggle != null)
             {
@@ -170,6 +179,9 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             if (logRecordToggle != null)
                 logRecordToggle.value = McpLogRecord.IsEnabled;
 
+            if (diagnosticLogToggle != null)
+                diagnosticLogToggle.value = EditorPrefs.GetBool(EditorPrefKeys.DiagnosticLogEnabled, true);
+
             devModeForceRefreshToggle.value = EditorPrefs.GetBool(EditorPrefKeys.DevModeForceServerRefresh, false);
             if (allowLanHttpBindToggle != null)
             {
@@ -228,6 +240,14 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                 logRecordToggle.RegisterValueChangedCallback(evt =>
                 {
                     McpLogRecord.IsEnabled = evt.newValue;
+                });
+            }
+
+            if (diagnosticLogToggle != null)
+            {
+                diagnosticLogToggle.RegisterValueChangedCallback(evt =>
+                {
+                    McpDiagnosticLog.SetEnabled(evt.newValue);
                 });
             }
 
@@ -368,6 +388,8 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             debugLogsToggle.value = EditorPrefs.GetBool(EditorPrefKeys.DebugLogs, false);
             if (logRecordToggle != null)
                 logRecordToggle.value = McpLogRecord.IsEnabled;
+            if (diagnosticLogToggle != null)
+                diagnosticLogToggle.value = EditorPrefs.GetBool(EditorPrefKeys.DiagnosticLogEnabled, true);
             devModeForceRefreshToggle.value = EditorPrefs.GetBool(EditorPrefKeys.DevModeForceServerRefresh, false);
             if (allowLanHttpBindToggle != null)
             {

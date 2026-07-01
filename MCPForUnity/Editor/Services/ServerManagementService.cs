@@ -326,11 +326,14 @@ namespace MCPForUnity.Editor.Services
                     StoreLocalHttpServerHandshake(pidFilePath, instanceToken);
                 }
                 McpLog.Info($"Started local HTTP server in terminal: {launchCommand}");
+                McpDiagnosticLog.Info("Hub", $"local HTTP server start requested port={portForPid} pidfile={pidFilePath ?? "(none)"} instanceToken={instanceToken}");
+                HttpAutoConnectAfterStart.Arm();
                 return true;
             }
             catch (Exception ex)
             {
                 McpLog.Error($"Failed to start server: {ex.Message}");
+                McpDiagnosticLog.Exception("Hub", "local HTTP server start failed", ex);
                 if (!quiet)
                 {
                     EditorUtility.DisplayDialog(
@@ -518,12 +521,15 @@ namespace MCPForUnity.Editor.Services
         private bool StopLocalHttpServerInternal(bool quiet, int? portOverride = null, bool allowNonLocalUrl = false)
         {
             string httpUrl = HttpEndpointUtility.GetLocalBaseUrl();
+            McpDiagnosticLog.Info("Hub", $"StopLocalHttpServer requested url={httpUrl} portOverride={portOverride} quiet={quiet}");
+            HttpAutoConnectAfterStart.Disarm("server stop requested");
             if (!allowNonLocalUrl && !IsLocalUrl(httpUrl))
             {
                 if (!quiet)
                 {
                     McpLog.Warn("Cannot stop server: URL is not local.");
                 }
+                McpDiagnosticLog.Warn("Hub", "StopLocalHttpServer aborted: URL is not local");
                 return false;
             }
 

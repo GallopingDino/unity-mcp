@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services.Transport.Transports;
@@ -16,6 +17,8 @@ namespace MCPForUnity.Editor.Services.Transport
         private TransportState _stdioState = TransportState.Disconnected("stdio");
         private Func<IMcpTransportClient> _webSocketFactory;
         private Func<IMcpTransportClient> _stdioFactory;
+        private readonly SemaphoreSlim _httpStartLock = new(1, 1);
+        private readonly SemaphoreSlim _stdioStartLock = new(1, 1);
 
         public TransportManager()
         {
@@ -44,25 +47,49 @@ namespace MCPForUnity.Editor.Services.Transport
 
         public async Task<bool> StartAsync(TransportMode mode)
         {
-            IMcpTransportClient client = GetOrCreateClient(mode);
-
-            bool started = await client.StartAsync();
-            if (!started)
+            SemaphoreSlim startLock = mode switch
             {
-                try
-                {
-                    await client.StopAsync();
-                }
-                catch (Exception ex)
-                {
-                    McpLog.Warn($"Error while stopping transport {client.TransportName}: {ex.Message}");
-                }
-                UpdateState(mode, TransportState.Disconnected(client.TransportName, client.State?.Error ?? "Failed to start"));
-                return false;
-            }
+                TransportMode.Http => _httpStartLock,
+                TransportMode.Stdio => _stdioStartLock,
+                _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported transport mode"),
+            };
 
-            UpdateState(mode, client.State ?? TransportState.Connected(client.TransportName));
-            return true;
+            await startLock.WaitAsync();
+            try
+            {
+                // Idempotent: a concurrent caller already brought this mode up.
+                // Without this guard, the client's StartAsync would unconditionally
+                // tear down the live socket and re-connect, which the server sees
+                // as a session-end (close 1000) and — under --ephemeral — exits.
+                if (IsRunning(mode))
+                {
+                    return true;
+                }
+
+                IMcpTransportClient client = GetOrCreateClient(mode);
+
+                bool started = await client.StartAsync();
+                if (!started)
+                {
+                    try
+                    {
+                        await client.StopAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        McpLog.Warn($"Error while stopping transport {client.TransportName}: {ex.Message}");
+                    }
+                    UpdateState(mode, TransportState.Disconnected(client.TransportName, client.State?.Error ?? "Failed to start"));
+                    return false;
+                }
+
+                UpdateState(mode, client.State ?? TransportState.Connected(client.TransportName));
+                return true;
+            }
+            finally
+            {
+                startLock.Release();
+            }
         }
 
         public async Task StopAsync(TransportMode? mode = null)

@@ -19,6 +19,7 @@ namespace MCPForUnity.Editor.Constants
         internal const string UnitySocketPort = "MCPForUnity.UnitySocketPort";
         internal const string ResumeHttpAfterReload = "MCPForUnity.ResumeHttpAfterReload";
         internal const string ResumeStdioAfterReload = "MCPForUnity.ResumeStdioAfterReload";
+        internal const string AutoConnectAfterServerStartDeadlineUtc = "MCPForUnity.AutoConnectAfterServerStart.DeadlineUtc";
 
         internal const string UvxPathOverride = "MCPForUnity.UvxPath";
         internal const string ClaudeCliPathOverride = "MCPForUnity.ClaudeCliPath";
@@ -69,6 +70,7 @@ namespace MCPForUnity.Editor.Constants
         internal const string AutoStartOnLoad = "MCPForUnity.AutoStartOnLoad";
         internal const string BatchExecuteMaxCommands = "MCPForUnity.BatchExecute.MaxCommands";
         internal const string LogRecordEnabled = "MCPForUnity.LogRecordEnabled";
+        internal const string DiagnosticLogEnabled = "MCPForUnity.DiagnosticLogEnabled";
 
         internal const string ExecuteCodeCompiler = "MCPForUnity.ExecuteCode.Compiler";
     }

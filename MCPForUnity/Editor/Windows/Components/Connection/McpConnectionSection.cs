@@ -28,6 +28,16 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
             Stdio
         }
 
+        // Transitional phase shown in the status row while a session is being brought up.
+        private enum ConnectionPhase
+        {
+            Idle,
+            StartingServer,
+            Connecting,
+        }
+
+        private const double StartingServerTimeoutSeconds = 180.0;
+
         // UI Elements
         private EnumField transportDropdown;
         private VisualElement transportMismatchWarning;
@@ -43,6 +53,7 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
         private Label httpServerCommandHint;
         private TextField httpUrlField;
         private Button startHttpServerButton;
+        private Label localServerStatusLabel;
         private VisualElement unitySocketPortRow;
         private TextField unityPortField;
         private VisualElement statusIndicator;
@@ -58,6 +69,9 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
 
         private bool connectionToggleInProgress;
         private bool httpServerToggleInProgress;
+        private ConnectionPhase connectionPhase = ConnectionPhase.Idle;
+        private double startingServerDeadline;
+        private double lastConnectAttemptTime;
         private Task verificationTask;
         private string lastHealthStatus;
         private double lastLocalServerRunningPollTime;
@@ -101,6 +115,7 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
             httpServerCommandHint = Root.Q<Label>("http-server-command-hint");
             httpUrlField = Root.Q<TextField>("http-url");
             startHttpServerButton = Root.Q<Button>("start-http-server-button");
+            localServerStatusLabel = Root.Q<Label>("local-server-status-text");
             unitySocketPortRow = Root.Q<VisualElement>("unity-socket-port-row");
             unityPortField = Root.Q<TextField>("unity-port");
             statusIndicator = Root.Q<VisualElement>("status-indicator");
@@ -349,7 +364,12 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
             // We use lastLocalServerRunning which was just refreshed by UpdateStartHttpButtonState() above.
             if (connectionToggleButton != null)
             {
-                bool showSessionToggle = !showLocalServerControls || lastLocalServerRunning;
+                // In HTTP Local single-button mode (ephemeral/remote-hosted/unknown),
+                // Start Session is the only entry point — show it even before the server
+                // is up so the click can auto-start the managed server.
+                bool showSessionToggle = !showLocalServerControls
+                    || lastLocalServerRunning
+                    || IsServerEphemeralOrHostedOrUnknown();
                 connectionToggleButton.style.display = showSessionToggle ? DisplayStyle.Flex : DisplayStyle.None;
             }
 
@@ -379,7 +399,18 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                 bool isStdioResuming = stdioSelected
                     && EditorPrefs.GetBool(EditorPrefKeys.ResumeStdioAfterReload, false);
 
-                if (isStdioResuming)
+                if (connectionPhase != ConnectionPhase.Idle)
+                {
+                    // Auto-start in progress: surface a transitional status so the user sees progress.
+                    connectionStatusLabel.text = connectionPhase == ConnectionPhase.StartingServer
+                        ? "Starting server..."
+                        : "Connecting...";
+                    statusIndicator.RemoveFromClassList("connected");
+                    statusIndicator.RemoveFromClassList("disconnected");
+                    connectionToggleButton.text = "Start Session";
+                    connectionToggleButton.SetEnabled(false);
+                }
+                else if (isStdioResuming)
                 {
                     connectionStatusLabel.text = "Resuming...";
                     // Keep the indicator in a neutral/transitional state
@@ -439,9 +470,83 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                     : savedPort).ToString();
             }
 
-            // For stdio session toggling, make End Session visually "danger" (red).
-            // (HTTP Local uses the consolidated Start/Stop Server button instead.)
-            connectionToggleButton?.EnableInClassList("server-running", isRunning && stdioSelected);
+            // Make End Session red when it is the destructive lifecycle action —
+            // stdio (kills the bridge) or HTTP ephemeral/remote-hosted (no separate Stop Server).
+            bool sessionEndIsDestructive = stdioSelected || IsServerEphemeralOrHostedOrUnknown();
+            connectionToggleButton?.EnableInClassList("server-running", isRunning && sessionEndIsDestructive);
+
+        }
+
+        // Called from the editor-window tick. Drives the WebSocket connect once the
+        // existing 0.75s server-reachability probe sees the managed server come up —
+        // but only while we are explicitly in the "waiting for server to start" phase.
+        // Lives outside UpdateConnectionStatus so the UI-render method stays free of
+        // network side effects.
+        public void EvaluateAutoConnect()
+        {
+            if (connectionPhase != ConnectionPhase.StartingServer) return;
+            if (connectionToggleInProgress) return;
+
+            // Defensive: StartingServer is only set in HTTP Local flows. If the user
+            // switched transport mid-wait, abandon the phase rather than connecting blind.
+            if (!IsHttpLocalSelected())
+            {
+                connectionPhase = ConnectionPhase.Idle;
+                UpdateConnectionStatus();
+                return;
+            }
+
+            if (EditorApplication.timeSinceStartup > startingServerDeadline)
+            {
+                connectionPhase = ConnectionPhase.Idle;
+                McpLog.Warn("Auto-start timed out: server did not become reachable.");
+                UpdateConnectionStatus();
+                return;
+            }
+
+            if (!lastLocalServerRunning) return;
+            // Cooldown between WebSocket connect attempts. Largely shadowed by the
+            // editor-tick throttle (2s), kept as a defensive lower bound.
+            const double connectAttemptCooldownSeconds = 2.0;
+            if (EditorApplication.timeSinceStartup - lastConnectAttemptTime < connectAttemptCooldownSeconds) return;
+
+            lastConnectAttemptTime = EditorApplication.timeSinceStartup;
+            _ = ConnectAfterServerReadyAsync();
+        }
+
+        private async Task ConnectAfterServerReadyAsync()
+        {
+            if (connectionToggleInProgress) return;
+            connectionToggleInProgress = true;
+            connectionPhase = ConnectionPhase.Connecting;
+            UpdateConnectionStatus();
+            try
+            {
+                // Brief grace: WebSocket endpoint may come up a beat after the HTTP probe.
+                await Task.Delay(TimeSpan.FromSeconds(1));
+                bool started = await MCPServiceLocator.Bridge.StartAsync();
+                if (started)
+                {
+                    await VerifyBridgeConnectionAsync();
+                    connectionPhase = ConnectionPhase.Idle;
+                }
+                else
+                {
+                    // Connect failed (likely WebSocket not ready yet). Fall back to
+                    // StartingServer so the next tick retries after the cooldown.
+                    connectionPhase = ConnectionPhase.StartingServer;
+                }
+            }
+            catch
+            {
+                connectionPhase = ConnectionPhase.StartingServer;
+            }
+            finally
+            {
+                connectionToggleInProgress = false;
+                connectionToggleButton?.SetEnabled(true);
+                UpdateConnectionStatus();
+            }
         }
 
         public void UpdateHttpServerCommandDisplay()
@@ -593,17 +698,28 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                 localServerRunning = lastLocalServerRunning;
             }
 
-            // Hide the Stop Server button entirely when the connected server is ephemeral
-            // or remote-hosted — those servers self-terminate (or are not user-owned),
-            // so "End Session" is the only safe primary action. Default to hidden until
-            // the welcome message arrives so we never offer a destructive action prematurely.
-            bool hideStopServer = httpLocalSelected
-                && localServerRunning
-                && IsServerEphemeralOrHostedOrUnknown();
-            if (hideStopServer)
+            // When the server is (or will likely be) owned by the session — ephemeral,
+            // remote-hosted, or unconfirmed cold-start — replace the Start/Stop Server
+            // button with informational text. This keeps the row's structural layout
+            // and avoids the visually misleading "Start Server / End Session" pair,
+            // while explaining the auto-managed lifecycle. The button only re-appears
+            // for persistent managed servers (welcome confirms non-ephemeral, non-hosted).
+            bool sessionOwnsServer = httpLocalSelected && IsServerEphemeralOrHostedOrUnknown();
+            if (sessionOwnsServer)
             {
                 startHttpServerButton.style.display = DisplayStyle.None;
+                if (localServerStatusLabel != null)
+                {
+                    localServerStatusLabel.style.display = DisplayStyle.Flex;
+                    localServerStatusLabel.text = GetLocalServerStatusText(localServerRunning);
+                    localServerStatusLabel.tooltip =
+                        "Server starts automatically when you start a session and self-terminates shortly after the last session ends.";
+                }
                 return;
+            }
+            if (localServerStatusLabel != null)
+            {
+                localServerStatusLabel.style.display = DisplayStyle.None;
             }
             if (httpLocalSelected)
             {
@@ -637,6 +753,23 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                 return true;
             }
             return client.ServerEphemeral || client.ServerHttpRemoteHosted;
+        }
+
+        private string GetLocalServerStatusText(bool serverRunning)
+        {
+            if (connectionPhase == ConnectionPhase.StartingServer && !serverRunning)
+            {
+                return "Starting...";
+            }
+            var client = MCPServiceLocator.TransportManager.GetClient(TransportMode.Http)
+                as WebSocketTransportClient;
+            if (client != null && client.WelcomeReceived && client.ServerHttpRemoteHosted)
+            {
+                return "Remote-hosted";
+            }
+            return serverRunning
+                ? "Running · auto-managed"
+                : "Starts with session";
         }
 
         private void RefreshHttpUi()
@@ -677,8 +810,9 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                 else
                 {
                     // Start Server: launch the local HTTP server.
-                    // When WE start the server, auto-start our session (we clearly want to use it).
-                    // This differs from detecting an already-running server, where we require manual session start.
+                    // We set the StartingServer phase and arm the deadline; the editor-tick
+                    // EvaluateAutoConnect picks up the connect once the existing 0.75s probe
+                    // sees the server. No internal polling loop here.
                     if (!TryGetLocalHttpLaunchPolicy(out _, out string localPolicyError))
                     {
                         string errorMsg = localPolicyError ?? "HTTP Local URL is blocked by current security settings.";
@@ -688,14 +822,15 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                     }
 
                     bool serverStarted = MCPServiceLocator.Server.StartLocalHttpServer();
-                    if (serverStarted)
-                    {
-                        await TryAutoStartSessionAsync();
-                    }
-                    else
+                    if (!serverStarted)
                     {
                         McpLog.Warn("Failed to start local HTTP server");
+                        return;
                     }
+
+                    connectionPhase = ConnectionPhase.StartingServer;
+                    startingServerDeadline = EditorApplication.timeSinceStartup + StartingServerTimeoutSeconds;
+                    lastConnectAttemptTime = 0;
                 }
             }
             catch (Exception ex)
@@ -709,60 +844,6 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                 RefreshHttpUi();
                 UpdateConnectionStatus();
             }
-        }
-
-        private async Task TryAutoStartSessionAsync()
-        {
-            // Wait briefly for the HTTP server to become ready, then start the session.
-            // This is called when THIS instance starts the server (not when detecting an external server).
-            var bridgeService = MCPServiceLocator.Bridge;
-            // Windows/dev mode may take much longer due to uv package resolution, fresh downloads, antivirus scans, etc.
-            const int maxAttempts = 30;
-            // Use shorter delays initially, then longer delays to allow server startup
-            var shortDelay = TimeSpan.FromMilliseconds(500);
-            var longDelay = TimeSpan.FromSeconds(3);
-
-            for (int attempt = 0; attempt < maxAttempts; attempt++)
-            {
-                var delay = attempt < 6 ? shortDelay : longDelay;
-
-                // Check if server is actually accepting connections
-                bool serverDetected = MCPServiceLocator.Server.IsLocalHttpServerReachable();
-
-                if (serverDetected)
-                {
-                    // Server detected - try to connect
-                    bool started = await bridgeService.StartAsync();
-                    if (started)
-                    {
-                        await VerifyBridgeConnectionAsync();
-                        UpdateConnectionStatus();
-                        return;
-                    }
-                }
-                else if (attempt >= 20)
-                {
-                    // After many attempts without detection, try connecting anyway as a last resort.
-                    // This handles cases where process detection fails but the server is actually running.
-                    // Only try once every 3 attempts to avoid spamming connection errors (at attempts 20, 23, 26, 29).
-                    if ((attempt - 20) % 3 != 0) continue;
-
-                    bool started = await bridgeService.StartAsync();
-                    if (started)
-                    {
-                        await VerifyBridgeConnectionAsync();
-                        UpdateConnectionStatus();
-                        return;
-                    }
-                }
-
-                if (attempt < maxAttempts - 1)
-                {
-                    await Task.Delay(delay);
-                }
-            }
-
-            McpLog.Warn("Failed to auto-start session after launching the HTTP server.");
         }
 
         private void PersistUnityPortFromField()
@@ -842,6 +923,30 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                         return;
                     }
 
+                    // Single-button UX: when in HTTP Local and no server is reachable,
+                    // launch the managed server. We then enter StartingServer phase and let
+                    // EvaluateAutoConnect (driven by the editor tick + 0.75s probe) fire
+                    // the WebSocket connect once the server is up. No internal polling here.
+                    if (httpLocalSelected && !MCPServiceLocator.Server.IsLocalHttpServerReachable())
+                    {
+                        bool serverStarted = MCPServiceLocator.Server.StartLocalHttpServer();
+                        if (!serverStarted)
+                        {
+                            EditorUtility.DisplayDialog(
+                                "Failed to Start Server",
+                                "The local MCP server could not be launched. Check the console for details.",
+                                "OK");
+                            McpLog.Warn("Failed to start local HTTP server when starting session.");
+                            return;
+                        }
+                        connectionPhase = ConnectionPhase.StartingServer;
+                        startingServerDeadline = EditorApplication.timeSinceStartup + StartingServerTimeoutSeconds;
+                        lastConnectAttemptTime = 0;
+                        return;
+                    }
+
+                    connectionPhase = ConnectionPhase.Connecting;
+                    UpdateConnectionStatus();
                     bool started = await bridgeService.StartAsync();
                     if (started)
                     {
@@ -869,6 +974,12 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
             finally
             {
                 connectionToggleInProgress = false;
+                // Only the synchronous Connecting phase is reset here. StartingServer must
+                // survive — it is the handoff signal to EvaluateAutoConnect on the editor tick.
+                if (connectionPhase == ConnectionPhase.Connecting)
+                {
+                    connectionPhase = ConnectionPhase.Idle;
+                }
                 connectionToggleButton?.SetEnabled(true);
                 UpdateConnectionStatus();
             }

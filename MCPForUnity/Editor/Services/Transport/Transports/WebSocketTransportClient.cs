@@ -38,6 +38,13 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
         private static readonly TimeSpan DefaultKeepAliveInterval = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan DefaultCommandTimeout = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(30);
+        // Threshold beyond which a single send is treated as suspicious and bumped to WARN.
+        private const long SlowSendWarnMs = 500;
+        // Threshold beyond which the synchronous main-thread tool list fetch is treated as suspicious.
+        private const long SlowMainThreadWaitWarnMs = 1000;
+        // Multiplier applied to keep-alive interval to detect a stalled pong cadence.
+        private const int PongStalenessMultiplier = 2;
 
         private readonly IToolDiscoveryService _toolDiscoveryService;
         private ClientWebSocket _socket;
@@ -45,6 +52,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private CancellationTokenSource _connectionCts;
         private Task _receiveTask;
         private Task _keepAliveTask;
+        private Task _heartbeatTask;
         private readonly SemaphoreSlim _sendLock = new(1, 1);
 
         private Uri _endpointUri;
@@ -64,6 +72,11 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private volatile bool _serverHttpRemoteHosted;
         private volatile bool _welcomeReceived;
 
+        // TickCount64 timestamps for liveness tracking. Read via Interlocked.Read so 32-bit hosts
+        // see a torn-free value. 0 means "never observed yet".
+        private long _lastPingRecvTicks;
+        private long _lastPongSentTicks;
+
         public WebSocketTransportClient(IToolDiscoveryService toolDiscoveryService = null)
         {
             _toolDiscoveryService = toolDiscoveryService;
@@ -81,6 +94,21 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
         /// <summary>True after the first welcome message has been processed.</summary>
         public bool WelcomeReceived => _welcomeReceived;
+
+        /// <summary>
+        /// True when the underlying socket is open and the server has assigned a session id —
+        /// i.e. <see cref="TrySendExpectReconnectSync"/> can succeed right now. This becomes
+        /// true on the receive thread as soon as the <c>registered</c> message is processed,
+        /// independent of <see cref="TransportManager"/>'s aggregated state which is only
+        /// updated when the <see cref="StartAsync"/> continuation resumes on the captured
+        /// SynchronizationContext. Reload hooks that need to know whether a usable session
+        /// exists must consult this rather than the aggregated state to avoid a window where
+        /// the socket is registered but the manager has not yet observed it.
+        /// </summary>
+        public bool HasLiveSession =>
+            _socket != null
+            && _socket.State == WebSocketState.Open
+            && !string.IsNullOrEmpty(_sessionId);
 
         private Task<List<ToolMetadata>> GetEnabledToolsOnMainThreadAsync(CancellationToken token)
         {
@@ -129,8 +157,11 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             _endpointUri = BuildWebSocketUri(HttpEndpointUtility.GetBaseUrl());
             _sessionId = null;
 
+            McpDiagnosticLog.Info("WS", $"StartAsync project={_projectName} hash={_projectHash} unity={_unityVersion} endpoint={_endpointUri}");
+
             if (!await EstablishConnectionAsync(_lifecycleCts.Token))
             {
+                McpDiagnosticLog.Warn("WS", "StartAsync: EstablishConnectionAsync returned false");
                 await StopAsync();
                 return false;
             }
@@ -138,6 +169,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             // State is connected but session ID might be pending until 'registered' message
             _state = TransportState.Connected(TransportDisplayName, sessionId: "pending", details: _endpointUri.ToString());
             _isConnected = true;
+            McpDiagnosticLog.Info("WS", $"StartAsync ok endpoint={_endpointUri}");
             return true;
         }
 
@@ -147,6 +179,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             {
                 return;
             }
+
+            McpDiagnosticLog.Info("WS", $"StopAsync session={_sessionId ?? "(none)"} socketState={_socket?.State.ToString() ?? "null"}");
 
             try
             {
@@ -162,10 +196,30 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 {
                     if (_socket.State == WebSocketState.Open || _socket.State == WebSocketState.CloseReceived)
                     {
-                        await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Shutdown", CancellationToken.None).ConfigureAwait(false);
+                        // Send our close frame (code 1000) without waiting for the server's
+                        // acknowledgement. CloseAsync waits for the full bidirectional
+                        // handshake, which frequently fails to complete within the Editor's
+                        // 750ms shutdown budget — especially under --ephemeral, where the
+                        // server starts its own shutdown the moment it processes our close
+                        // frame and may not get a chance to send its close-back. The result
+                        // was that the server saw a truncated/missing payload (close code
+                        // 1005) instead of a clean 1000, and could not distinguish editor
+                        // quit from a transient abort. CloseOutputAsync just enqueues our
+                        // close frame; the OS TCP stack flushes it before Dispose closes
+                        // the connection, so the server reliably receives code 1000.
+                        using var sendCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+                        try
+                        {
+                            await _socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Shutdown", sendCts.Token).ConfigureAwait(false);
+                            McpDiagnosticLog.Info("WS", "StopAsync: close-output frame sent");
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            McpDiagnosticLog.Warn("WS", "StopAsync: close-output send timed out after 200ms — server may see abnormal disconnect");
+                        }
                     }
                 }
-                catch { }
+                catch (Exception ex) { McpDiagnosticLog.Exception("WS", "StopAsync: close-output failed", ex); }
                 finally
                 {
                     _socket.Dispose();
@@ -190,12 +244,14 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         /// </summary>
         public void ForceStop()
         {
+            McpDiagnosticLog.Info("WS", $"ForceStop session={_sessionId ?? "(none)"} socketState={_socket?.State.ToString() ?? "null"}");
+
             try { _lifecycleCts?.Cancel(); } catch { }
             try { _connectionCts?.Cancel(); } catch { }
 
             if (_socket != null)
             {
-                try { _socket.Abort(); } catch { }
+                try { _socket.Abort(); } catch (Exception ex) { McpDiagnosticLog.Exception("WS", "ForceStop: socket Abort failed", ex); }
                 try { _socket.Dispose(); } catch { }
                 _socket = null;
             }
@@ -204,6 +260,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             _connectionCts = null;
             _receiveTask = null;
             _keepAliveTask = null;
+            _heartbeatTask = null;
             Interlocked.Exchange(ref _isReconnectingFlag, 0);
             _isConnected = false;
             _state = TransportState.Disconnected(TransportDisplayName);
@@ -226,11 +283,13 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         {
             if (_socket == null || _socket.State != WebSocketState.Open)
             {
+                McpDiagnosticLog.Warn("WS", $"expect_reconnect skipped: socketState={_socket?.State.ToString() ?? "null"} reason={reason}");
                 return false;
             }
             string sessionId = _sessionId;
             if (string.IsNullOrEmpty(sessionId))
             {
+                McpDiagnosticLog.Warn("WS", $"expect_reconnect skipped: sessionId not yet assigned (welcome not processed) reason={reason}");
                 return false;
             }
 
@@ -243,13 +302,79 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             byte[] bytes = Encoding.UTF8.GetBytes(payload.ToString(Formatting.None));
             var buffer = new ArraySegment<byte>(bytes);
 
+            McpDiagnosticLog.Info("Send", $"expect_reconnect reason={reason} session={sessionId} timeoutMs={timeoutMs}");
+
             try
             {
                 Task sendTask = _socket.SendAsync(buffer, WebSocketMessageType.Text, true, CancellationToken.None);
-                return sendTask.Wait(TimeSpan.FromMilliseconds(timeoutMs));
+                bool ok = sendTask.Wait(TimeSpan.FromMilliseconds(timeoutMs));
+                if (ok)
+                {
+                    McpDiagnosticLog.Info("WS", $"expect_reconnect send completed reason={reason}");
+                }
+                else
+                {
+                    McpDiagnosticLog.Warn("WS", $"expect_reconnect send TIMED OUT after {timeoutMs}ms reason={reason}; ForceStop will likely abort the socket before the byte leaves TCP — server will treat disconnect as session end");
+                }
+                return ok;
             }
-            catch
+            catch (Exception ex)
             {
+                McpDiagnosticLog.Exception("WS", $"expect_reconnect send threw reason={reason}", ex);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Best-effort synchronous send of a <c>session_end</c> message used in
+        /// <c>EditorApplication.quitting</c>, where async is not honored. Mirrors
+        /// <see cref="TrySendExpectReconnectSync"/> in shape: waits up to
+        /// <paramref name="timeoutMs"/>ms for the bytes to leave the socket so
+        /// the server can mark the session as cleanly ending and skip the
+        /// transport-recovery grace it would otherwise apply to a 1005 close.
+        /// </summary>
+        public bool TrySendSessionEndSync(string reason, int timeoutMs = 200)
+        {
+            if (_socket == null || _socket.State != WebSocketState.Open)
+            {
+                McpDiagnosticLog.Warn("WS", $"session_end skipped: socketState={_socket?.State.ToString() ?? "null"} reason={reason}");
+                return false;
+            }
+            string sessionId = _sessionId;
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                McpDiagnosticLog.Warn("WS", $"session_end skipped: sessionId not yet assigned (welcome not processed) reason={reason}");
+                return false;
+            }
+
+            var payload = new JObject
+            {
+                ["type"] = "session_end",
+                ["reason"] = reason,
+                ["session_id"] = sessionId
+            };
+            byte[] bytes = Encoding.UTF8.GetBytes(payload.ToString(Formatting.None));
+            var buffer = new ArraySegment<byte>(bytes);
+
+            McpDiagnosticLog.Info("Send", $"session_end reason={reason} session={sessionId} timeoutMs={timeoutMs}");
+
+            try
+            {
+                Task sendTask = _socket.SendAsync(buffer, WebSocketMessageType.Text, true, CancellationToken.None);
+                bool ok = sendTask.Wait(TimeSpan.FromMilliseconds(timeoutMs));
+                if (ok)
+                {
+                    McpDiagnosticLog.Info("WS", $"session_end send completed reason={reason}");
+                }
+                else
+                {
+                    McpDiagnosticLog.Warn("WS", $"session_end send TIMED OUT after {timeoutMs}ms reason={reason}; server may still apply transport-recovery grace");
+                }
+                return ok;
+            }
+            catch (Exception ex)
+            {
+                McpDiagnosticLog.Exception("WS", $"session_end send threw reason={reason}", ex);
                 return false;
             }
         }
@@ -270,7 +395,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             {
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_lifecycleCts.Token);
                 timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
-                await SendPongAsync(timeoutCts.Token).ConfigureAwait(false);
+                await SendPongAsync(timeoutCts.Token, "verify").ConfigureAwait(false);
                 return true;
             }
             catch (Exception ex)
@@ -329,20 +454,25 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                     _socket.Options.SetRequestHeader(AuthConstants.ApiKeyHeader, _apiKey);
                 }
 
+                McpDiagnosticLog.Info("WS", $"connect attempt host={candidate.Host} port={candidate.Port} scheme={candidate.Scheme}");
+
                 try
                 {
                     await _socket.ConnectAsync(candidate, connectionToken).ConfigureAwait(false);
                     connectedEndpoint = candidate;
+                    McpDiagnosticLog.Info("WS", $"connect ok host={candidate.Host} port={candidate.Port}");
                     break;
                 }
                 catch (OperationCanceledException) when (connectionToken.IsCancellationRequested)
                 {
+                    McpDiagnosticLog.Info("WS", $"connect cancelled host={candidate.Host}");
                     throw;
                 }
                 catch (Exception ex)
                 {
                     lastConnectError = ex;
                     McpLog.Debug($"[WebSocket] Connect failed for {candidate}: {ex.Message}");
+                    McpDiagnosticLog.Warn("WS", $"connect failed host={candidate.Host} port={candidate.Port} err={ex.GetType().Name}: {ex.Message}");
                 }
             }
 
@@ -350,6 +480,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             {
                 string errorMsg = "Connection failed. Check that the server URL is correct, the server is running, and your API key (if required) is valid.";
                 McpLog.Error($"[WebSocket] {errorMsg} (Detail: {lastConnectError?.Message ?? "Unknown error"})");
+                McpDiagnosticLog.Error("WS", $"all connect candidates failed; last error: {lastConnectError?.GetType().Name}: {lastConnectError?.Message ?? "unknown"}");
                 _state = TransportState.Disconnected(TransportDisplayName, errorMsg);
                 return false;
             }
@@ -370,6 +501,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             {
                 string regMsg = $"Registration with server failed: {ex.Message}";
                 McpLog.Error($"[WebSocket] {regMsg}");
+                McpDiagnosticLog.Exception("WS", "register send failed", ex);
                 _state = TransportState.Disconnected(TransportDisplayName, regMsg);
                 return false;
             }
@@ -415,6 +547,19 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 }
             }
 
+            if (_heartbeatTask != null)
+            {
+                if (awaitTasks)
+                {
+                    try { await _heartbeatTask.ConfigureAwait(false); } catch { }
+                    _heartbeatTask = null;
+                }
+                else if (_heartbeatTask.IsCompleted)
+                {
+                    _heartbeatTask = null;
+                }
+            }
+
             if (_connectionCts != null)
             {
                 _connectionCts.Dispose();
@@ -431,6 +576,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             _receiveTask = Task.Run(() => ReceiveLoopAsync(token), CancellationToken.None);
             _keepAliveTask = Task.Run(() => KeepAliveLoopAsync(token), CancellationToken.None);
+            _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(token), CancellationToken.None);
         }
 
         private async Task ReceiveLoopAsync(CancellationToken token)
@@ -453,12 +599,14 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 catch (WebSocketException wse)
                 {
                     McpLog.Warn($"[WebSocket] Receive loop error: {wse.Message}");
+                    McpDiagnosticLog.Exception("WS", $"receive loop WebSocketException code={wse.WebSocketErrorCode}", wse);
                     await HandleSocketClosureAsync(wse.Message).ConfigureAwait(false);
                     break;
                 }
                 catch (Exception ex)
                 {
                     McpLog.Warn($"[WebSocket] Unexpected receive error: {ex.Message}");
+                    McpDiagnosticLog.Exception("WS", "receive loop unexpected error", ex);
                     await HandleSocketClosureAsync(ex.Message).ConfigureAwait(false);
                     break;
                 }
@@ -484,6 +632,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
+                        McpDiagnosticLog.Info("WS", $"server initiated close code={result.CloseStatus} desc='{result.CloseStatusDescription}'");
                         await HandleSocketClosureAsync(result.CloseStatusDescription ?? "Server closed connection").ConfigureAwait(false);
                         return null;
                     }
@@ -527,6 +676,13 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             string messageType = payload.Value<string>("type") ?? string.Empty;
 
+            string recvSummary = messageType;
+            if (messageType == "execute")
+            {
+                recvSummary = $"execute id={payload.Value<string>("id")} name={payload.Value<string>("name")} timeout={payload.Value<int?>("timeout")}";
+            }
+            McpDiagnosticLog.Trace("Recv", recvSummary);
+
             switch (messageType)
             {
                 case "welcome":
@@ -539,7 +695,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                     await HandleExecuteAsync(payload, token).ConfigureAwait(false);
                     break;
                 case "ping":
-                    await SendPongAsync(token).ConfigureAwait(false);
+                    Interlocked.Exchange(ref _lastPingRecvTicks, McpDiagnosticHooks.MonotonicMs());
+                    await SendPongAsync(token, "ping_reply").ConfigureAwait(false);
                     break;
                 default:
                     // No-op for unrecognised types (keep-alives, telemetry, etc.)
@@ -567,6 +724,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             _serverEphemeral = payload.Value<bool?>("ephemeral") ?? false;
             _serverHttpRemoteHosted = payload.Value<bool?>("httpRemoteHosted") ?? false;
             _welcomeReceived = true;
+
+            McpDiagnosticLog.Info("WS", $"welcome ephemeral={_serverEphemeral} httpRemoteHosted={_serverHttpRemoteHosted} keepAlive={_keepAliveInterval.TotalSeconds}s socketKeepAlive={_socketKeepAliveInterval.TotalSeconds}s");
         }
 
         private async Task HandleRegisteredAsync(JObject payload, CancellationToken token)
@@ -578,8 +737,26 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 ProjectIdentityUtility.SetSessionId(_sessionId);
                 _state = TransportState.Connected(TransportDisplayName, sessionId: _sessionId, details: _endpointUri.ToString());
                 McpLog.Info($"[WebSocket] Registered with session ID: {_sessionId}", false);
+                McpDiagnosticLog.Info("WS", $"registered session={_sessionId}");
 
-                await SendRegisterToolsAsync(token).ConfigureAwait(false);
+                try
+                {
+                    await SendRegisterToolsAsync(token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    McpDiagnosticLog.Warn("WS", $"register_tools cancelled before send completed session={_sessionId} (likely domain reload mid-handshake — server will not receive tool list)");
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    McpDiagnosticLog.Exception("WS", $"register_tools failed session={_sessionId}", ex);
+                    throw;
+                }
+            }
+            else
+            {
+                McpDiagnosticLog.Warn("WS", "registered payload missing session_id");
             }
         }
 
@@ -588,9 +765,23 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             if (_toolDiscoveryService == null) return;
 
             token.ThrowIfCancellationRequested();
+            McpDiagnosticLog.Trace("WS", $"register_tools: requesting tool list from main thread session={_sessionId}");
+            var mainThreadSw = System.Diagnostics.Stopwatch.StartNew();
             var tools = await GetEnabledToolsOnMainThreadAsync(token).ConfigureAwait(false);
+            mainThreadSw.Stop();
+            if (mainThreadSw.ElapsedMilliseconds >= SlowMainThreadWaitWarnMs)
+            {
+                McpDiagnosticLog.Warn(
+                    "WS",
+                    $"register_tools: main-thread tool fetch took {mainThreadSw.ElapsedMilliseconds}ms (slow) {McpDiagnosticHooks.GetHealthSnapshot()}");
+            }
+            else
+            {
+                McpDiagnosticLog.Trace("WS", $"register_tools: main-thread tool fetch took {mainThreadSw.ElapsedMilliseconds}ms");
+            }
             token.ThrowIfCancellationRequested();
             McpLog.Info($"[WebSocket] Preparing to register {tools.Count} tool(s) with the bridge.", false);
+            McpDiagnosticLog.Info("WS", $"register_tools: building payload tools={tools.Count} session={_sessionId}");
             var toolsArray = new JArray();
 
             foreach (var tool in tools)
@@ -633,6 +824,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             await SendJsonAsync(payload, token).ConfigureAwait(false);
             McpLog.Info($"[WebSocket] Sent {tools.Count} tools registration", false);
+            McpDiagnosticLog.Info("WS", $"register_tools sent tools={tools.Count} session={_sessionId}");
         }
 
         public async Task ReregisterToolsAsync()
@@ -678,14 +870,19 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             };
 
             string responseJson;
+            var execStopwatch = System.Diagnostics.Stopwatch.StartNew();
             try
             {
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(token);
                 timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, timeoutSeconds)));
                 responseJson = await TransportCommandDispatcher.ExecuteCommandJsonAsync(commandEnvelope.ToString(Formatting.None), timeoutCts.Token).ConfigureAwait(false);
+                execStopwatch.Stop();
+                McpDiagnosticLog.Trace("Exec", $"id={commandId} name={commandName} ok ms={execStopwatch.ElapsedMilliseconds}");
             }
             catch (OperationCanceledException)
             {
+                execStopwatch.Stop();
+                McpDiagnosticLog.Warn("Exec", $"id={commandId} name={commandName} TIMEOUT after {timeoutSeconds}s (ms={execStopwatch.ElapsedMilliseconds})");
                 responseJson = JsonConvert.SerializeObject(new
                 {
                     status = "error",
@@ -694,6 +891,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
             catch (Exception ex)
             {
+                execStopwatch.Stop();
+                McpDiagnosticLog.Exception("Exec", $"id={commandId} name={commandName} failed ms={execStopwatch.ElapsedMilliseconds}", ex);
                 responseJson = JsonConvert.SerializeObject(new
                 {
                     status = "error",
@@ -722,21 +921,51 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 ["result"] = resultToken
             };
 
+            McpDiagnosticLog.Trace("Send", $"command_result id={commandId} bytes={responsePayload.ToString(Formatting.None).Length}");
             await SendJsonAsync(responsePayload, token).ConfigureAwait(false);
         }
 
         private async Task KeepAliveLoopAsync(CancellationToken token)
         {
+            // Track when we last expected to send a keep-alive pong so we can detect a stalled
+            // cadence (Task.Delay returning late, ThreadPool starvation, etc.).
+            long expectedNextTickMs = McpDiagnosticHooks.MonotonicMs() + (long)_keepAliveInterval.TotalMilliseconds;
             while (!token.IsCancellationRequested)
             {
                 try
                 {
                     await Task.Delay(_keepAliveInterval, token).ConfigureAwait(false);
+                    long actualTickMs = McpDiagnosticHooks.MonotonicMs();
+                    long overdueMs = actualTickMs - expectedNextTickMs;
+                    if (overdueMs > _keepAliveInterval.TotalMilliseconds)
+                    {
+                        McpDiagnosticLog.Warn(
+                            "WS",
+                            $"keep-alive tick overdue by {overdueMs}ms (expected interval={_keepAliveInterval.TotalSeconds}s) {McpDiagnosticHooks.GetHealthSnapshot()}");
+                    }
+                    expectedNextTickMs = actualTickMs + (long)_keepAliveInterval.TotalMilliseconds;
+
                     if (_socket == null || _socket.State != WebSocketState.Open)
                     {
+                        McpDiagnosticLog.Trace("WS", $"keep-alive loop exiting socketState={_socket?.State.ToString() ?? "null"}");
                         break;
                     }
-                    await SendPongAsync(token).ConfigureAwait(false);
+
+                    // If a previous send happened, warn when the gap exceeds the staleness threshold.
+                    long lastPongTicks = Interlocked.Read(ref _lastPongSentTicks);
+                    if (lastPongTicks != 0)
+                    {
+                        long gapMs = actualTickMs - lastPongTicks;
+                        long staleThresholdMs = (long)_keepAliveInterval.TotalMilliseconds * PongStalenessMultiplier;
+                        if (gapMs > staleThresholdMs)
+                        {
+                            McpDiagnosticLog.Warn(
+                                "WS",
+                                $"no pong sent for {gapMs}ms (threshold={staleThresholdMs}ms) {McpDiagnosticHooks.GetHealthSnapshot()}");
+                        }
+                    }
+
+                    await SendPongAsync(token, "keepalive").ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -745,9 +974,48 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 catch (Exception ex)
                 {
                     McpLog.Warn($"[WebSocket] Keep-alive failed: {ex.Message}");
+                    McpDiagnosticLog.Exception("WS", $"keep-alive failed {McpDiagnosticHooks.GetHealthSnapshot()}", ex);
                     await HandleSocketClosureAsync(ex.Message).ConfigureAwait(false);
                     break;
                 }
+            }
+        }
+
+        private async Task HeartbeatLoopAsync(CancellationToken token)
+        {
+            McpDiagnosticLog.Trace("Health", "heartbeat loop started");
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        await Task.Delay(HeartbeatInterval, token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+
+                    long now = McpDiagnosticHooks.MonotonicMs();
+                    long lastPing = Interlocked.Read(ref _lastPingRecvTicks);
+                    long lastPong = Interlocked.Read(ref _lastPongSentTicks);
+                    long pingAgo = lastPing == 0 ? -1L : (now - lastPing);
+                    long pongAgo = lastPong == 0 ? -1L : (now - lastPong);
+                    string socketState = _socket?.State.ToString() ?? "null";
+
+                    McpDiagnosticLog.Info(
+                        "Health",
+                        $"socket={socketState} session={(_sessionId ?? "(none)")} lastPingRecvAgoMs={pingAgo} lastPongSentAgoMs={pongAgo} keepAlive={_keepAliveInterval.TotalSeconds}s reconnecting={(Interlocked.CompareExchange(ref _isReconnectingFlag, 0, 0) == 1 ? "true" : "false")} {McpDiagnosticHooks.GetHealthSnapshot()}");
+                }
+            }
+            catch (Exception ex)
+            {
+                McpDiagnosticLog.Exception("Health", "heartbeat loop unexpected error", ex);
+            }
+            finally
+            {
+                McpDiagnosticLog.Trace("Health", "heartbeat loop ended");
             }
         }
 
@@ -763,17 +1031,43 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 ["project_path"] = _projectPath
             };
 
+            McpDiagnosticLog.Info("Send", $"register project={_projectName} hash={_projectHash}");
             await SendJsonAsync(registerPayload, token).ConfigureAwait(false);
         }
 
-        private Task SendPongAsync(CancellationToken token)
+        private async Task SendPongAsync(CancellationToken token, string reason)
         {
             var payload = new JObject
             {
                 ["type"] = "pong",
                 ["session_id"] = _sessionId  // Include session ID for server-side tracking
             };
-            return SendJsonAsync(payload, token);
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                await SendJsonAsync(payload, token).ConfigureAwait(false);
+                sw.Stop();
+                Interlocked.Exchange(ref _lastPongSentTicks, McpDiagnosticHooks.MonotonicMs());
+                if (sw.ElapsedMilliseconds >= SlowSendWarnMs)
+                {
+                    McpDiagnosticLog.Warn("Send", $"pong reason={reason} ms={sw.ElapsedMilliseconds} (slow) {McpDiagnosticHooks.GetHealthSnapshot()}");
+                }
+                else
+                {
+                    McpDiagnosticLog.Trace("Send", $"pong reason={reason} ms={sw.ElapsedMilliseconds}");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                McpDiagnosticLog.Warn("Send", $"pong reason={reason} FAILED after {sw.ElapsedMilliseconds}ms: {ex.GetType().Name}: {ex.Message}");
+                throw;
+            }
         }
 
         private async Task SendJsonAsync(JObject payload, CancellationToken token)
@@ -808,14 +1102,17 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             // Capture stack trace for debugging disconnection triggers
             var stackTrace = new System.Diagnostics.StackTrace(true);
             McpLog.Debug($"[WebSocket] HandleSocketClosureAsync called. Reason: {reason}\nStack trace:\n{stackTrace}");
+            McpDiagnosticLog.Info("WS", $"socket closure reason='{reason}' session={_sessionId ?? "(none)"} socketState={_socket?.State.ToString() ?? "null"}");
 
             if (_lifecycleCts == null || _lifecycleCts.IsCancellationRequested)
             {
+                McpDiagnosticLog.Trace("WS", "socket closure: lifecycle already cancelled — not reconnecting");
                 return;
             }
 
             if (Interlocked.CompareExchange(ref _isReconnectingFlag, 1, 0) != 0)
             {
+                McpDiagnosticLog.Trace("WS", "socket closure: reconnect already in progress — skipping");
                 return;
             }
 
@@ -830,31 +1127,39 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
         private async Task AttemptReconnectAsync(CancellationToken token)
         {
+            McpDiagnosticLog.Info("WS", "AttemptReconnectAsync: starting reconnect schedule");
             try
             {
                 await StopConnectionLoopsAsync().ConfigureAwait(false);
 
+                int attempt = 0;
                 foreach (TimeSpan delay in ReconnectSchedule)
                 {
+                    attempt++;
                     if (token.IsCancellationRequested)
                     {
+                        McpDiagnosticLog.Info("WS", $"AttemptReconnectAsync: cancelled before attempt {attempt}");
                         return;
                     }
 
                     if (delay > TimeSpan.Zero)
                     {
                         try { await Task.Delay(delay, token).ConfigureAwait(false); }
-                        catch (OperationCanceledException) { return; }
+                        catch (OperationCanceledException) { McpDiagnosticLog.Info("WS", $"AttemptReconnectAsync: cancelled during {delay.TotalSeconds}s backoff"); return; }
                     }
 
+                    McpDiagnosticLog.Info("WS", $"AttemptReconnectAsync: attempt {attempt}/{ReconnectSchedule.Length}");
                     if (await EstablishConnectionAsync(token).ConfigureAwait(false))
                     {
                         _state = TransportState.Connected(TransportDisplayName, sessionId: _sessionId, details: _endpointUri.ToString());
                         _isConnected = true;
                         McpLog.Info("[WebSocket] Reconnected to MCP server", false);
+                        McpDiagnosticLog.Info("WS", $"AttemptReconnectAsync: succeeded on attempt {attempt}");
                         return;
                     }
+                    McpDiagnosticLog.Warn("WS", $"AttemptReconnectAsync: attempt {attempt} failed");
                 }
+                McpDiagnosticLog.Warn("WS", "AttemptReconnectAsync: initial schedule exhausted; falling back to tail interval");
 
                 // Schedule exhausted — keep retrying every 30 s indefinitely so a transient
                 // server outage longer than ~49 s doesn't leave the plugin permanently dead.
